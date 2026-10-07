@@ -1,0 +1,13 @@
+services:
+  evening-energy:
+    build: .
+    container_name: evening-energy
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    volumes:
+      - ./data:/data
+    environment:
+      ENERGY_DATA_DIR: /data
+      TZ: Australia/Adelaide
+    mem_limit: 1800m

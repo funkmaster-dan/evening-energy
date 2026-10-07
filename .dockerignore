@@ -1,0 +1,14 @@
+.git
+.venv
+data
+hacs
+__pycache__
+
+.local
+AGENTS.md
+IMPLEMENTATION_PLAN.md
+SPECIFICATION.md
+scripts
+.env
+.env.*
+*.log

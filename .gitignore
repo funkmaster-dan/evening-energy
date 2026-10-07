@@ -1,0 +1,19 @@
+.venv/
+data/*
+!data/.gitkeep
+__pycache__/
+*.pyc
+.env
+# Local instructions, development notes and private deployment helpers.
+.local/
+AGENTS.md
+IMPLEMENTATION_PLAN.md
+SPECIFICATION.md
+scripts/deploy.py
+hacs/
+home_assistant/blueprints/
+home_assistant/force_export_automation.yaml
+home_assistant/force_discharge_5kw_automation.yaml
+.env.*
+!.env.example
+*.log

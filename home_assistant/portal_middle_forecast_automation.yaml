@@ -1,0 +1,33 @@
+id: alphaess_portal_middle_forecast_export
+alias: AlphaESS portal - middle forecast export at 5 kW
+description: Force discharge between 6 pm and 9 pm while middle excess energy is above zero.
+triggers:
+  - trigger: time
+    at: "18:00:00"
+  - trigger: time
+    at: "21:00:00"
+  - trigger: state
+    entity_id: sensor.evening_energy_excess_middle_energy
+actions:
+  - if:
+      - condition: time
+        after: "18:00:00"
+        before: "21:00:00"
+      - condition: numeric_state
+        entity_id: sensor.evening_energy_excess_middle_energy
+        above: 0
+    then:
+      - condition: state
+        entity_id: switch.alphaess_portal_force_discharge
+        state: "off"
+      - action: switch.turn_on
+        target:
+          entity_id: switch.alphaess_portal_force_discharge
+    else:
+      - condition: state
+        entity_id: switch.alphaess_portal_force_discharge
+        state: "on"
+      - action: switch.turn_off
+        target:
+          entity_id: switch.alphaess_portal_force_discharge
+mode: single

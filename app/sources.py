@@ -9,6 +9,8 @@ from .ha_inputs import numeric_value, history_values
 
 class HomeAssistant:
     def __init__(self, settings):
+        if not settings.ha_token:
+            raise ValueError('Enter a Home Assistant long-lived access token and save the connection first.')
         self.s=settings
         self.url=settings.ha_url.rstrip('/')
         self.headers={'Authorization':'Bearer '+settings.ha_token}
@@ -81,6 +83,8 @@ class HomeAssistant:
                     s=history_values(pieces,max(start,end-pd.Timedelta(days=30)),end,step)/(1000 if unit=='W' else 1)
             cols[entity]=s
         frame=pd.DataFrame(cols).sort_index()
+        # No recorder/history rows produces a RangeIndex; keep the time-index contract even when empty.
+        frame.index=pd.to_datetime(frame.index,utc=True)
         return frame.loc[(frame.index>=start)&(frame.index<end)]
 
 class Weather:

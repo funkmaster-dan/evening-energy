@@ -86,15 +86,19 @@ def train(settings,dataset_id,progress,epochs=30,fine_tune=False):
         dt=f.index.to_series().diff().dt.total_seconds()/3600
         de=soc.diff()*settings.battery_capacity_kwh/100
         energy=(power+power.shift(1))/2*dt
-        usable=(dt>0)&(dt<=0.12)&(soc>5)&(soc<97)&(soc.shift(1)>5)&(soc.shift(1)<97)&(energy.abs()>.025)&(de.abs()>.01)
+        # Include intervals between reported SoC changes: power flows continuously
+        # even when the sensor rounds the percentage to an unchanged value.
+        usable=(dt>0)&(dt<=0.12)&(soc>5)&(soc<97)&(soc.shift(1)>5)&(soc.shift(1)<97)&(energy.abs()>.025)
         tr=(f.index<d['train_end'])&usable; va=(f.index>=d['val_start'])&usable
-        if tr.sum()<24: raise ValueError('Not enough changing SoC and power samples to calibrate battery efficiency.')
+        if tr.sum()<24: raise ValueError('Not enough battery power and SoC samples to calibrate battery efficiency.')
         correlation=float(energy.loc[tr].corr(de.loc[tr])); sign=1 if correlation<0 else -1
         # Normalize positive power to discharge.
         e=energy*sign
-        charge=tr&(e<0)&(de>0); discharge=tr&(e>0)&(de<0)
+        charge=tr&(e<0); discharge=tr&(e>0)
         if charge.sum()<10 or discharge.sum()<10: raise ValueError('Need both charge and discharge history to calibrate efficiency.')
-        charge_eta=float(de[charge].sum()/(-e[charge]).sum()); discharge_eta=float(e[discharge].sum()/(-de[discharge]).sum())
+        charge_change=de[charge].sum(); discharge_change=de[discharge].sum()
+        if charge_change<=0 or discharge_change>=0: raise ValueError('Battery SoC does not track measured charge and discharge power. Check the sensors.')
+        charge_eta=float(charge_change/(-e[charge]).sum()); discharge_eta=float(e[discharge].sum()/(-discharge_change))
         if not (.5<=charge_eta<=1.15 and .5<=discharge_eta<=1.15): raise ValueError(f'Efficiency does not match measured SoC: charge {charge_eta:.2f}, discharge {discharge_eta:.2f}. Check the power and SoC sensors.')
         charge_eta=min(.995,charge_eta); discharge_eta=min(.995,discharge_eta)
         predicted=np.where(e<0,-e*charge_eta,-e/discharge_eta)

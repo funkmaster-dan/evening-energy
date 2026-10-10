@@ -55,7 +55,7 @@ The first build downloads CPU PyTorch and the other model dependencies. Settings
 ### Configure your home
 
 1. In Home Assistant, create a **long-lived access token** from your user profile.
-2. In **Configuration**, enter the HA URL/token, save, and check the connection.
+2. In **Configuration**, enter the HA URL/token and click **Save & check connection**. This saves the connection fields; use **Save configuration** for other changes.
 3. Select your consumption, solar, battery power and battery SoC entities. Power sensors should report **W or kW**; SoC should report **%**.
 4. Set your location, timezone and Australian state, battery capacity/limits, minimum SoC, reserve, charging windows and export tariff times.
 5. Add your solar panel banks and set their tilt/azimuth. Capacity and conversion efficiency are inferred during calibration.

@@ -9,6 +9,8 @@ from .ha_inputs import numeric_value, history_values
 
 class HomeAssistant:
     def __init__(self, settings):
+        if not settings.ha_token:
+            raise ValueError('Enter a Home Assistant long-lived access token and save the connection first.')
         self.s=settings
         self.url=settings.ha_url.rstrip('/')
         self.headers={'Authorization':'Bearer '+settings.ha_token}

@@ -1,7 +1,7 @@
 import json, os
 from pathlib import Path
 from datetime import date, timedelta
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 DATA = Path(os.getenv('ENERGY_DATA_DIR', 'data'))
 DATA.mkdir(parents=True, exist_ok=True)
@@ -73,6 +73,11 @@ class Settings(BaseModel):
     export_end: str = '21:00'
     charging_windows: list[Window] = [Window()]
     banks: list[Bank] = [Bank(id='north', name='Main array', entity='sensor.solar_inverter_power', azimuth=0)]
+
+    @field_validator('ha_token', 'ha_url')
+    @classmethod
+    def strip_connection_whitespace(cls, value):
+        return value.strip()
 
     def save(self):
         (DATA / 'config.json').write_text(self.model_dump_json(indent=2))

@@ -115,9 +115,9 @@ def config(): return settings.public()
 async def save_config(body:dict):
     global settings
     data={**settings.model_dump(),**{k:v for k,v in body.items() if k not in ('token_configured',)}}
-    if not body.get('ha_token'): data['ha_token']=settings.ha_token
     try:
         next_settings=Settings(**data)
+        if not next_settings.ha_token: next_settings.ha_token=settings.ha_token
         ZoneInfo(next_settings.timezone)
         pd.Timestamp(next_settings.load_history_start,tz=next_settings.timezone)
         if next_settings.state not in ['ACT','NSW','NT','QLD','SA','TAS','VIC','WA']: raise ValueError('Choose an Australian state or territory')

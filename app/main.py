@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import DATA, Settings, load_settings, read_json, write_json
 from .sources import HomeAssistant, store_live
 from .ha_inputs import numeric_value, state_available, snapshot_age
+from .setup import inspect_setup
 from .datasets import build_dataset, list_datasets
 from .models import train, list_models, model_ready
 from .forecast import Forecaster, inside
@@ -143,6 +144,11 @@ async def connect_ha():
         await asyncio.to_thread(refresh_live)
         return {'connected':True,'entities':len(entities),'live':live}
     except Exception as exc: raise HTTPException(400,str(exc))
+
+@app.get('/api/setup')
+async def setup_check():
+    try: return await asyncio.to_thread(inspect_setup, settings)
+    except Exception as exc: raise HTTPException(400, str(exc))
 
 @app.get('/api/entities')
 async def get_entities(context:str='power',search:str=''):

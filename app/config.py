@@ -64,6 +64,7 @@ class Settings(BaseModel):
     battery_power_entity: str = 'sensor.battery_power'
     battery_soc_entity: str = 'sensor.battery_soc'
     solar_ct_entity: str = 'sensor.solar_power'
+    solar_ct_proxy: bool = False
     battery_capacity_kwh: float = Field(default=10, gt=0)
     battery_charge_limit_kw: float = Field(default=5, gt=0)
     battery_discharge_limit_kw: float = Field(default=5, gt=0)

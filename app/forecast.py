@@ -135,6 +135,7 @@ class Forecaster:
         if not ready_solar: warnings.append('One or more panel-bank models need calibration.')
         if not battery_ready: warnings.append('Battery efficiencies need measured calibration.')
         if not inverter_ready: warnings.append('CT / inverter efficiency needs calibration.')
+        if settings.solar_ct_proxy: warnings.append('Solar monitoring uses a PV proxy; inverter efficiency and achievable export are approximate until an independent AC/CT sensor is configured.')
         elapsed=now.timestamp()
         need_load=force or self.load_cache is None or elapsed-self.load_at>=settings.load_interval_minutes*60 or self.load_cache.index.max()<hours[-1]
         need_solar=force or self.solar_cache is None or elapsed-self.solar_at>=settings.solar_interval_minutes*60 or self.solar_cache.index.max()<hours[-1]

@@ -62,6 +62,22 @@ The first build downloads CPU PyTorch and the other model dependencies. Settings
 
 Defaults are examples, not a description of your home or tariff. Replace the example sensor IDs and settings before building datasets. Existing installations retain their saved configuration.
 
+### Choose and check sensors
+
+**Save & check connection** confirms access to Home Assistant. The Configuration panel then checks each saved sensor against the current HA state, shows its unit and recent recorder coverage, and flags missing or unavailable selections. A successful connection alone does not mean the selected sensors are correct. Historical replacement sensors may be absent from current HA state but still have useful recorded data.
+
+| Configuration field | Choose a sensor that reports |
+| --- | --- |
+| Live home consumption and consumption history | Whole-home consumption power in W or kW, not grid import or a cumulative kWh total. Use the same sensor in both fields unless you are extending older history with a replacement sensor. |
+| Solar bank | PV production power for one panel orientation. Use one aggregate sensor if all panels face the same direction; use separate string sensors when orientations differ. Do not count both strings and their aggregate. |
+| Battery I/O power | Battery charge/discharge power in W or kW from one signed sensor. The calibration detects which sign means discharge. |
+| Battery state of charge | The same battery's charge percentage, in %. |
+| Solar monitoring | An independent solar AC/CT power reading when available. If you must use a PV-derived reading, tick **This is a PV proxy**; the resulting inverter factor and achievable export are approximate. Do not use inverter total output when it also includes battery power. |
+
+Set **usable battery capacity (kWh)** to the energy represented by its SoC sensor. Solar nameplate capacity is different; the app infers panel output from measured data. Enter your panel azimuth and tilt for each bank.
+
+The Training data panel suggests dates from the most recent 30 days of recorded history. Its suggestions are a starting point: check the reported coverage before building. The consumption model needs at least seven training days and ten validation days; battery calibration needs five-minute readings with both charging and discharging.
+
 ### Build and calibrate
 
 1. Open **Training data** and choose a model and recorded sensors.

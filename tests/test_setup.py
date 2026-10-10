@@ -5,7 +5,7 @@ import pandas as pd
 from fastapi.testclient import TestClient
 
 from app.config import Bank, Settings
-from app.setup import inspect_setup
+from app.setup import inspect_setup, _coverage
 from app import main
 
 
@@ -125,8 +125,38 @@ class SetupTests(unittest.TestCase):
         ha.history = history
         report = inspect_setup(settings(), ha, NOW)
         self.assertEqual(report['roles'][0]['history']['source'], 'state history')
-        self.assertEqual(report['roles'][0]['history']['rows'], 1)
+        self.assertEqual(report['roles'][0]['history']['rows'], 19 * 24)
         self.assertEqual(report['roles'][0]['history']['first'], (NOW - pd.Timedelta(days=19)).isoformat())
+
+    def test_unchanged_history_covers_the_requested_window_and_suggests_dates(self):
+        ha = FakeHA()
+        ha.statistics = lambda *args: {}
+        ha.history = lambda *args: [[{'state': '1.2', 'last_changed': (NOW - pd.Timedelta(days=31)).isoformat()}]]
+        report = inspect_setup(settings(), ha, NOW)
+        load = report['roles'][0]['history']
+        battery = report['roles'][1]['history']
+        self.assertEqual(load['rows'], 30 * 24)
+        self.assertEqual(load['first'], (NOW - pd.Timedelta(days=30)).isoformat())
+        self.assertEqual(load['last'], (NOW - pd.Timedelta(hours=1)).isoformat())
+        self.assertEqual(battery['rows'], 30 * 24 * 12)
+        self.assertEqual(battery['last'], (NOW - pd.Timedelta(minutes=5)).isoformat())
+        self.assertEqual(report['suggestions']['load']['validation_end'], '2026-10-10')
+
+    def test_unavailable_history_is_not_filled_and_limits_coverage(self):
+        ha = FakeHA()
+        ha.statistics = lambda *args: {}
+        start = NOW - pd.Timedelta(days=30)
+        ha.history = lambda *args: [[
+            {'state': '1.2', 'last_changed': start.isoformat()},
+            {'state': 'unavailable', 'last_changed': (start + pd.Timedelta(days=10)).isoformat()},
+            {'state': '2.4', 'last_changed': (start + pd.Timedelta(days=20)).isoformat()},
+            {'state': 'unknown', 'last_changed': (start + pd.Timedelta(days=25)).isoformat()},
+        ]]
+        for period, per_hour in [('hour', 1), ('5minute', 12)]:
+            with self.subTest(period=period):
+                coverage = _coverage(ha, ['sensor.home'], start, NOW, period)['sensor.home']
+                self.assertEqual(coverage['rows'], 15 * 24 * per_hour)
+                self.assertEqual(coverage['last'], (start + pd.Timedelta(days=25) - pd.Timedelta(hours=1 / per_hour)).isoformat())
 
     def test_endpoint_returns_report_without_token(self):
         with patch.object(main, 'settings', Settings()):

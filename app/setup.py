@@ -2,7 +2,7 @@
 from datetime import timedelta
 import pandas as pd
 from .sources import HomeAssistant
-from .ha_inputs import numeric_value
+from .ha_inputs import numeric_value, history_values
 
 POWER_UNITS = {'W', 'kW'}
 
@@ -32,10 +32,14 @@ def _coverage(ha, ids, start, end, period):
             source = 'state history'
             try:
                 groups = ha.history(entity, start, end)
-                times = [_timestamp(row.get('last_updated') or row.get('last_changed'))
-                         for group in groups for row in group
-                         if (row.get('last_updated') or row.get('last_changed'))
-                         and numeric_value(row) is not None]
+                pieces = [(_timestamp(row.get('last_updated') or row.get('last_changed')), numeric_value(row))
+                          for group in groups for row in group
+                          if (row.get('last_updated') or row.get('last_changed'))]
+                if pieces:
+                    # States hold between changes; unavailable transitions end coverage.
+                    samples = history_values(pieces, start, end, '5min' if period == '5minute' else '1h')
+                    samples = samples.loc[(samples.index >= start) & (samples.index < end)]
+                    times = samples.dropna().index.tolist()
             except Exception:
                 source = 'history unavailable'
         result[entity] = {

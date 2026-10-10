@@ -157,6 +157,7 @@ class Forecaster:
                 historical=features(Weather(settings).fetch(history_start,hours[0],historical=True),settings,calendar)
                 f=pd.concat([historical.loc[historical.index<hours[0]-pd.Timedelta(hours=72)],f]).sort_index();f=f[~f.index.duplicated(keep='last')]
                 recent=HomeAssistant(settings).frame(settings.historical_consumption_entities,history_start,hours[0])
+                if recent.empty: warnings.append('No recorded consumption history is available. Check the consumption history sensors in Configuration.')
                 observed=splice(recent,settings.historical_consumption_entities) if not recent.empty else pd.Series(dtype=float)
                 meta=read_json('model-load',{})
                 profile=meta.get('hour_profile',{})

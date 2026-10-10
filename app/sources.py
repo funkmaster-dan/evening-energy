@@ -83,6 +83,8 @@ class HomeAssistant:
                     s=history_values(pieces,max(start,end-pd.Timedelta(days=30)),end,step)/(1000 if unit=='W' else 1)
             cols[entity]=s
         frame=pd.DataFrame(cols).sort_index()
+        # No recorder/history rows produces a RangeIndex; keep the time-index contract even when empty.
+        frame.index=pd.to_datetime(frame.index,utc=True)
         return frame.loc[(frame.index>=start)&(frame.index<end)]
 
 class Weather:

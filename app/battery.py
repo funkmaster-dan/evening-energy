@@ -27,19 +27,26 @@ def window_day(t,w):
 IMPORT_TOLERANCE_KWH=.01
 RESERVE_TOLERANCE_SOC=.001
 DELIVERY_TOLERANCE_KWH=.001
-POLICY='half-day-energy-fixed-discharge-v1'
+POLICY='half-day-energy-multiple-windows-v2'
 
 
 def export_mask(settings,rows,cutoff=None):
-    """Only the first current/upcoming export window is eligible."""
-    eligible=np.array([export_active(pd.Timestamp(r['time']).tz_convert(settings.timezone),settings)
-                       and (cutoff is None or pd.Timestamp(r['time'])<cutoff) for r in rows])
-    active=np.flatnonzero(eligible)
-    if len(active):
-        last=active[0]
-        while last+1<len(rows) and eligible[last+1]:last+=1
-        eligible[last+1:]=False
-    return eligible
+    """Every configured export interval before an optional cutoff."""
+    return np.array([export_active(pd.Timestamp(r['time']).tz_convert(settings.timezone),settings)
+                     and (cutoff is None or pd.Timestamp(r['time'])<cutoff) for r in rows])
+
+
+def export_periods(settings,rows):
+    """Separate each daily window occurrence, including overnight windows."""
+    periods=[];previous=None
+    for i,row in enumerate(rows):
+        t=pd.Timestamp(row['time']).tz_convert(settings.timezone)
+        key=next(((j,window_day(t,w)) for j,w in enumerate(settings.export_windows) if inside(t,w.start,w.end)),None)
+        if key is not None:
+            if key!=previous:periods.append([])
+            periods[-1].append(i)
+        previous=key
+    return periods
 
 
 def acceptable(settings,rows,candidate,outside):
@@ -51,20 +58,23 @@ def acceptable(settings,rows,candidate,outside):
 
 
 def simulate_paths(settings,rows,net,initial_soc,eta_c,eta_d,used_allowance=None,
-                   export_kwh=0.,export_cutoff=None,record_flows=False):
+                   export_kwh=0.,export_cutoff=None,record_flows=False,export_schedule=None):
     """Advance one or many paths; optionally retain detailed display flows."""
     net=np.asarray(net,float);n,steps=net.shape
     capacity=settings.battery_capacity_kwh;minimum=capacity*settings.minimum_soc/100
     energy=np.broadcast_to(np.asarray(initial_soc,float),(n,)).copy()*capacity/100
     reserve=minimum+settings.reserve_kwh
     eligible=export_mask(settings,rows,export_cutoff)
-    requested=np.broadcast_to(np.asarray(export_kwh,float),(n,)).copy();remaining=requested.copy()
+    scheduled_starts={period[0] for period in export_periods(settings,rows)} if export_schedule is not None else set()
+    remaining=np.broadcast_to(np.asarray(export_kwh,float),(n,)).copy();delivered=np.zeros(n)
     usage={k:np.full(n,v,float) for k,v in (used_allowance or {}).items()}
     soc=np.empty((n,steps));outside=np.zeros((n,steps))
     flows={key:np.empty((n,steps)) for key in ('grid_import_kw','battery_export_kw','power_limited_import_kw','energy_shortfall_import_kw','charge_kw','discharge_kw','household_import_kw','grid_charge_kw','requested_discharge_kw','battery_discharge_kw')} if record_flows else None
     if record_flows:flows['outside_window_import_kw']=outside
     for i,row in enumerate(rows):
         t=pd.Timestamp(row['time']).tz_convert(settings.timezone);dt=row['hours']
+        if i in scheduled_starts:
+            remaining=np.broadcast_to(np.asarray(export_schedule.get(i,0.),float),(n,)).copy()
         window=next(((j,w) for j,w in enumerate(settings.charging_windows) if inside(t,w.start,w.end)),None)
         surplus=np.maximum(0,-net[:,i]);demand=np.maximum(0,net[:,i])
         charge=np.where(net[:,i]<=0,np.minimum(np.minimum(surplus,settings.battery_charge_limit_kw),(capacity-energy)/(eta_c*dt)),0.)
@@ -94,11 +104,11 @@ def simulate_paths(settings,rows,net,initial_soc,eta_c,eta_d,used_allowance=None
         active=eligible[i]&(remaining>1e-9)
         amount=np.where(active,np.maximum(0,remaining)/dt,0.)
         extra=np.minimum(np.maximum(0,amount),np.minimum(np.maximum(0,rate-discharge),np.maximum(0,energy-reserve)*eta_d/dt))
-        energy-=extra*dt/eta_d;remaining-=extra*dt
+        energy-=extra*dt/eta_d;remaining-=extra*dt;delivered+=extra*dt
         soc[:,i]=100*np.maximum(0,energy)/capacity
         if record_flows:
             for key,value in [('grid_import_kw',imported),('battery_export_kw',extra),('charge_kw',charge),('discharge_kw',discharge),('household_import_kw',household_import),('grid_charge_kw',grid_charge),('requested_discharge_kw',np.where(active,rate,0.)),('battery_discharge_kw',discharge+extra)]:flows[key][:,i]=value
-    result=(soc,outside,requested-remaining)
+    result=(soc,outside,delivered)
     return (*result,flows) if record_flows else result
 
 
@@ -129,3 +139,21 @@ def allowances(settings,rows,net,soc,eta_c,eta_d,usage,cutoff,include_stored=Tru
             ok=valid(candidate,outside)&(delivered>=amount-DELIVERY_TOLERANCE_KWH)
             lower=np.where(ok,amount,lower);upper=np.where(ok,upper,amount)
     return stored,np.maximum(0,np.floor(lower*100)/100)
+
+
+def plan_exports(settings,rows,net,soc,eta_c,eta_d,usage):
+    """Allocate each window in time order, protecting the full forecast horizon."""
+    n=len(net);schedule={}
+    for period in export_periods(settings,rows):
+        start=period[0]
+        maximum=sum(rows[i]['hours']*export_rate(pd.Timestamp(rows[i]['time']).tz_convert(settings.timezone),settings) for i in period)
+        lower=np.zeros(n);upper=np.full(n,maximum)
+        committed=sum(schedule.values(),np.zeros(n))
+        for _ in range(22):
+            amount=(lower+upper)/2
+            candidate,outside,delivered=simulate_paths(settings,rows,net,soc,eta_c,eta_d,usage,
+                                                      export_schedule={**schedule,start:amount})
+            ok=acceptable(settings,rows,candidate,outside)&(delivered>=committed+amount-DELIVERY_TOLERANCE_KWH)
+            lower=np.where(ok,amount,lower);upper=np.where(ok,upper,amount)
+        schedule[start]=np.maximum(0,np.floor(lower*100)/100)
+    return schedule

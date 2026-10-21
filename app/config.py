@@ -44,7 +44,7 @@ class Settings(BaseModel):
     weather_model: str = 'ecmwf_ifs'
     load_max_power_kw: float = Field(default=40, gt=0)
     solar_max_power_kw: float = Field(default=40, gt=0)
-    horizon_hours: int = Field(default=48, ge=1, le=72)
+    horizon_hours: int = Field(default=48, ge=24, le=72)
     mc_samples: int = Field(default=5000, ge=10, le=5000)
     load_interval_minutes: int = Field(default=60, ge=5)
     solar_interval_minutes: int = Field(default=60, ge=5)

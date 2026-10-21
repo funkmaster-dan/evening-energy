@@ -14,7 +14,7 @@ The app forecasts and reports. **It never sends commands to your battery.**
 
 ![Energy overview with live readings and consumption, solar and temperature forecasts](docs/images/dashboard.png)
 
-*Screenshots show actual readings and model results from a local Podman instance using a private copy of deployment data. Location, maps, connection details and sensor identifiers are outside the captured areas. These are example outcomes for one installation, not performance guarantees.*
+*Screenshots show real readings and model results from the app. Address, map, coordinates, connection details and sensor identifiers are excluded. These illustrate one installation, not performance guarantees.*
 
 ## What’s in the app
 
@@ -25,7 +25,8 @@ The app forecasts and reports. **It never sends commands to your battery.**
 | **Settings** | Connect Home Assistant, select sensors, place your home on a map, configure panel banks and battery limits, and manage charging/export windows. |
 
 - **Consumption and solar forecasts:** separate LightGBM models for home use and each solar panel orientation, with P10/P50/P90 hourly uncertainty estimates.
-- **Weather on the chart:** temperature uses its own °C axis alongside consumption and solar in kW. Hover or tap to inspect aligned power and battery forecasts.
+- **History and forecasts together:** both charts include the previous 24 hours of recorded Home Assistant consumption, solar and battery charge, with a clear forecast boundary. Recent-past temperature comes from Open-Meteo model data, not an on-site thermometer.
+- **Compact forecast summaries:** cumulative consumption, solar, export and grid-import totals use 24-hour steps through the selected horizon. Summaries sit beside charts on wide screens and underneath on smaller screens. Temperature has its own °C axis; hover or tap to inspect aligned readings and forecasts.
 - **Battery planning:** calibrated charge/discharge and inverter efficiencies, usable capacity, minimum charge, an additional reserve, and scheduled grid charging.
 - **Multiple daily windows:** separate charging and export windows, including overnight windows and optional custom power rates.
 - **Local storage and training:** settings, recorded history, prepared datasets and trained models stay in your mounted data directory. Forecasts use Home Assistant and external weather/calendar services.
@@ -54,8 +55,8 @@ podman-compose up -d --build
 Open **Settings**:
 
 1. Create a Home Assistant **long-lived access token** from your user profile. Enter your HA URL and token, save, then use **Check saved connection**.
-2. Select live home consumption, battery charge/discharge power, battery state of charge, and solar output sensors. Select consumption history sources separately if a sensor has been replaced.
-3. Set your location using the map or latitude/longitude fields. Choose your timezone, Australian state or territory, weather model and forecast length, up to **72 hours**.
+2. Select live home consumption, battery charge/discharge power, battery state of charge, and solar output sensors. Models defaults to these saved live sensors; select additional historical sources there if a sensor has been replaced.
+3. Set your location using the map or latitude/longitude fields. Choose your timezone, Australian state or territory, weather model and forecast length, from **24 to 72 hours**.
 4. Enter usable battery capacity, charge/discharge limits, minimum state of charge and additional reserve.
 5. Add one solar bank per panel orientation, selecting its production sensor, azimuth and tilt. Panel capacity is estimated during calibration.
 6. Configure charging and export windows to match your tariff and battery automation, then **Save settings**.
@@ -68,7 +69,7 @@ Defaults are examples. Replace them with your own sensors, battery specification
 
 Open **Models** and select home consumption, a solar bank, battery efficiency or solar inverter efficiency:
 
-1. Choose separate training and validation dates and check the selected sensors. Suggestions use recent recorded history; saved dataset dates are retained when you return to a model.
+1. Choose separate training and validation dates and check the selected sensors. Defaults use the live sensors saved in Settings; add older replacement sensors here when needed. Suggestions use recent recorded history, and saved dataset dates are retained when you return to a model. Set **Maximum valid power** here to exclude implausible readings from a dataset.
 2. Click **Prepare data**. Review coverage, the prepared-history chart and **Data quality and history coverage**.
 3. Click **Train candidate**. Your active model continues to be used.
 4. Review the candidate’s errors and measured-versus-predicted chart. Where a compatible active model exists, both are compared on the same validation periods.
@@ -110,7 +111,7 @@ A large excess can coexist with a smaller achievable export. The battery may hav
 
 ### Choose an energy scenario
 
-Use the battery chart’s **Scenario** selector or click a row under **Export scenarios**. The headline energy metrics follow your selection.
+Use the battery chart’s **Scenario** selector. The headline cards and battery projection follow your selection; **No export** shows zero achievable export and typical consumption and solar.
 
 | Scenario | Solar energy | Home consumption energy |
 | --- | --- | --- |
@@ -119,11 +120,13 @@ Use the battery chart’s **Scenario** selector or click a row under **Export sc
 | **Optimistic** | Higher: P90 | Lower: P10 |
 | **No export** | Middle scenario | Middle scenario, with export disabled |
 
-Energy targets come from complete sampled forecast paths for local **06:00–18:00** and **18:00–06:00** blocks. Partial blocks use only the covered forecast hours. Each scenario follows the forecast’s hourly shape, scaled to its block energy targets, with no solar production during darkness. Expand **Day and night energy totals** for the targets and covered periods.
+Energy targets come from complete sampled forecast paths for local **06:00–18:00** and **18:00–06:00** blocks. Partial blocks use only the covered forecast hours. Each scenario follows the forecast’s hourly shape, scaled to its block energy targets, with no solar production during darkness. The battery trajectory uses those block energy targets; the visible summary table reports cumulative totals for the selected forecast horizon.
 
-![Battery charge projection, minimum charge and separate export scenarios](docs/images/battery-projection.png)
+![Battery charge history and forecast, charging and export windows, and cumulative energy totals](docs/images/battery-projection.png)
 
-The battery chart shows the selected scenario’s charge trajectory, minimum charge, additional reserve and export periods. Its shading compares the three energy scenarios **at the selected export allowance**; it is a scenario range, not a probability interval. The power chart’s P10–P90 shading describes hourly consumption and solar uncertainty separately.
+The battery chart shows recorded charge followed by the selected scenario’s projection, minimum charge, additional reserve, and all charging and export periods. Its shading compares the three energy scenarios **at the selected per-window export allowances**; it is a scenario range, not a probability interval. The power chart’s P10–P90 shading describes hourly consumption and solar uncertainty separately.
+
+Summary columns show the next 24, 48 and 72 hours where applicable, ending at the configured length: a 40-hour forecast shows 24-hour and 40-hour totals. Recorded history is excluded from these forecast totals. Grid imports are split between time inside and outside configured charging windows.
 
 Export planning checks the **entire configured forecast horizon**. It seeks an allowance that preserves minimum charge plus reserve and avoids household grid imports beyond configured charging allowances. If those conditions cannot be met without export, the scenario reports zero allowance. Time, power limits, reserve or a later low point can leave the battery above minimum charge the next morning.
 
@@ -136,8 +139,8 @@ In **Settings → Charging and export schedule**:
 - Add one or more daily windows to either column. Start/end times may cross midnight.
 - A charging window’s **Import allowance (kWh)** covers both home use and battery charging.
 - **Inverter maximum** uses the configured battery charge or discharge limit. Untick it to enter a custom rate for that window; the battery’s configured maximum still caps the rate.
-- Planning uses the **first current or upcoming export window** within the forecast. It does not optimize a whole day’s exports across every window.
-- Home use takes priority during export. Export stops when its calculated energy allowance is reached or the window ends. Scenarios change the energy allowance; they use the same configured window rate.
+- The battery projection simulates **every charging and export window** within the forecast. Export allowances are allocated in time order, with each allocation preserving household needs and reserve across the full horizon. The headline achievable-export metric still reports the current or next window.
+- Home use takes priority during export. Each export window stops when its own calculated energy allowance is reached or the window ends. Scenarios change the energy allowance; they use the same configured window rate.
 
 These windows describe expected behavior. Your battery controller or Home Assistant automations must perform the actual charging and exporting.
 
@@ -216,4 +219,4 @@ Weather and tilted irradiance come from [Open-Meteo](https://open-meteo.com/); s
 
 ## License
 
-[MIT](LICENSE). See the [changelog](CHANGELOG.md) for the v1 release overview.
+[MIT](LICENSE). See the [changelog](CHANGELOG.md) for release notes.

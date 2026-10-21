@@ -8,14 +8,14 @@ from .forecast_policy import record_issue,settled_records,recent_correction,SETT
 from .load_training import LoadPredictor
 from .quality import QUALITY_POLICY, effective_policy, LOAD_PIPELINE, quality_frame, target_bounds, load_context_metadata, attach_load_context
 from .uncertainty import energy_scenarios
-from .battery import (inside, export_active, export_rate, window_day, simulate_paths, allowances, acceptable,
+from .battery import (inside, export_active, export_rate, window_day, simulate_paths, allowances, acceptable, export_periods, plan_exports,
                       POLICY, IMPORT_TOLERANCE_KWH, RESERVE_TOLERANCE_SOC, DELIVERY_TOLERANCE_KWH)
 
-def simulate(settings, rows, initial_soc, eta_c, eta_d, export_kwh=0, export_cutoff=None, used_allowance=None):
+def simulate(settings, rows, initial_soc, eta_c, eta_d, export_kwh=0, export_cutoff=None, used_allowance=None, export_schedule=None):
     """Format a single path from the shared battery engine for existing callers."""
     net=np.asarray([r['net_demand_kw'] for r in rows],float).reshape(1,-1)
     soc,outside,delivered,flows=simulate_paths(settings,rows,net,initial_soc,eta_c,eta_d,used_allowance,
-                                             export_kwh,export_cutoff,record_flows=True)
+                                             export_kwh,export_cutoff,record_flows=True,export_schedule=export_schedule)
     rounded={'grid_import_kw','battery_export_kw','charge_kw','discharge_kw'}
     result=[]
     for i,row in enumerate(rows):
@@ -91,44 +91,77 @@ def project(settings,rows,soc,eta_c,eta_d,usage,trusted,periods):
         scenario_rows[key]=[{**r,'load_scenario_kw':float(load[i]),'solar_scenario_kw':float(solar[i]),'net_demand_kw':float(load[i]-solar[i])} for i,r in enumerate(rows)]
     scenario_net=np.asarray([[r['net_demand_kw'] for r in scenario_rows[k]] for k in keys])
     available={k:0. for k in keys};values=dict(available)
-    peak=[i for i,r in enumerate(rows) if r['peak_window']];cutoff=None
+    periods_export=export_periods(settings,rows)
+    peak=periods_export[0] if periods_export else [];cutoff=None
     if peak:
-        last=peak[0]
-        while last+1 in peak:last+=1
-        peak=peak[:peak.index(last)+1]
+        last=peak[-1]
         cutoff=pd.Timestamp(rows[last]['time'])+pd.Timedelta(hours=rows[last]['hours'])
+    schedule={}
     if trusted:
-        stored,exported=allowances(settings,rows,scenario_net,initial,eta_c,eta_d,usage,cutoff)
-        available=dict(zip(keys,stored.tolist()));values=dict(zip(keys,exported.tolist()))
+        stored,_=allowances(settings,rows,scenario_net,initial,eta_c,eta_d,usage,None)
+        schedule=plan_exports(settings,rows,scenario_net,initial,eta_c,eta_d,usage)
+        available=dict(zip(keys,stored.tolist()))
+        if peak:values=dict(zip(keys,schedule[peak[0]].tolist()))
     baseline_states,baseline_imports,_=simulate_paths(settings,rows,scenario_net,initial,eta_c,eta_d,usage)
     baseline_safe=acceptable(settings,rows,baseline_states,baseline_imports)
     imports=sum(float(baseline_imports[1,i])*r['hours'] for i,r in enumerate(rows));projections={}
     for plan in ('none',*keys):
         key='middle' if plan=='none' else plan;amount=0. if plan=='none' else values[plan]
-        centre,unallowed,delivered=simulate(settings,scenario_rows[key],initial,eta_c,eta_d,amount,cutoff,usage)
+        selected_schedule={start:float(target[keys.index(key)]) if plan!='none' else 0. for start,target in schedule.items()}
+        centre,unallowed,delivered=simulate(settings,scenario_rows[key],initial,eta_c,eta_d,used_allowance=usage,export_schedule=selected_schedule)
         centre_safe=bool(acceptable(settings,rows,np.asarray([[r['soc'] for r in centre]]),np.asarray([[r['outside_window_import_kw'] for r in centre]]))[0])
-        states=simulate_paths(settings,rows,scenario_net,initial,eta_c,eta_d,usage,amount,cutoff)[0]
+        states=simulate_paths(settings,rows,scenario_net,initial,eta_c,eta_d,usage,export_schedule=selected_schedule)[0]
         lower=states.min(axis=0);upper=states.max(axis=0);projection=[]
         for i,r in enumerate(rows):
             projection.append({'time':r['time'],'hours':r['hours'],'peak_window':r['peak_window'],
+                               'charging_window':any(inside(pd.Timestamp(r['time']).tz_convert(settings.timezone),w.start,w.end) for w in settings.charging_windows),
                                'soc_point':centre[i]['soc'] if soc is not None else None,
                                'soc_scenario_low':float(lower[i]) if soc is not None else None,
                                'soc_scenario_high':float(upper[i]) if soc is not None else None,
                                'load_scenario_kw':scenario_rows[key][i]['load_scenario_kw'],
                                'solar_scenario_kw':scenario_rows[key][i]['solar_scenario_kw'],
                                **{f:centre[i][f] for f in ('requested_discharge_kw','battery_discharge_kw','grid_import_kw','battery_export_kw')}})
-        projections[plan]={'requested_export_kwh':amount,'modeled_export_kwh':round(delivered,3),
+        projections[plan]={'requested_export_kwh':amount,'modeled_export_kwh':round(sum(centre[i]['battery_export_kw']*rows[i]['hours'] for i in peak),3),
+                           'total_modeled_export_kwh':round(delivered,3),
+                           'total_requested_export_kwh':round(sum(selected_schedule.values()),3),
+                           'export_windows':[{'start':rows[period[0]]['time'],
+                                              'end':(pd.Timestamp(rows[period[-1]]['time'])+pd.Timedelta(hours=rows[period[-1]]['hours'])).isoformat(),
+                                              'requested_export_kwh':selected_schedule.get(period[0],0.),
+                                              'discharge_rate_kw':export_rate(pd.Timestamp(rows[period[0]]['time']).tz_convert(settings.timezone),settings)} for period in periods_export],
                            'discharge_rate_kw':export_rate(pd.Timestamp(rows[peak[0]]['time']).tz_convert(settings.timezone),settings) if peak else 0.,'scenario':SCENARIOS[key],
                            'baseline_feasible':bool(baseline_safe[keys.index(key)]) if trusted else None,
                            'scenario_feasible':centre_safe if trusted else None,'unallowed_import_kwh':round(unallowed,3),
-                           'flow_basis':'Selected 12-hour energy scenario following the forecast hourly shape at the fixed discharge rate',
+                           'flow_basis':'Selected 12-hour energy scenario with a separate allowance for each export window at its configured discharge rate',
                            'policy':POLICY,'forecast':projection}
     return available,values,projections,imports,peak,cutoff
+
+
+def chart_history(settings,now):
+    """Twenty-four hours of recorded five-minute averages from the live sensors."""
+    start=now-pd.Timedelta(hours=24)
+    sensors={'load_actual':settings.consumption_entity,'solar_actual':settings.solar_ct_entity,'soc_actual':settings.battery_soc_entity}
+    frame=HomeAssistant(settings).frame(list(dict.fromkeys(sensors.values())),start,now,period='5minute')
+    rows=[]
+    for t,values in frame.iterrows():
+        time=max(start,t+pd.Timedelta(minutes=2.5))
+        if time>=now:continue
+        rows.append({'time':time.isoformat(),**{key:float(values[entity]) if pd.notna(values[entity]) else None for key,entity in sensors.items()}})
+    # Open-Meteo's recent-past coverage is model-based, not an on-site observation.
+    try:
+        weather=consumption_weather(settings,start.floor('h'),now.ceil('h'))['temperature_2m']
+        times=pd.DatetimeIndex([pd.Timestamp(r['time']) for r in rows])
+        temperatures=weather.reindex(weather.index.union(times)).sort_index().interpolate(method='time',limit_area='inside').reindex(times)
+    except Exception:
+        temperatures=pd.Series(float('nan'),index=range(len(rows)))
+    for row,value in zip(rows,temperatures):row['temperature_actual']=float(value) if pd.notna(value) else None
+
+    return rows
 
 
 class Forecaster:
     def __init__(self):
         self.load_cache=None; self.solar_cache=None; self.load_at=0; self.solar_at=0
+        self.history_cache=[];self.history_at=0
 
     def reset(self): self.load_at=0; self.solar_at=0; self.load_cache=None; self.solar_cache=None
 
@@ -217,6 +250,7 @@ class Forecaster:
         for a,b in zip(boundaries,boundaries[1:]):
             t=a.floor('h')
             row={'time':a.isoformat(),'hours':(b-a).total_seconds()/3600,'peak_window':export_active(a.tz_convert(settings.timezone),settings),**self.load_cache.loc[t].to_dict(),**self.solar_cache.loc[t].to_dict()}
+            row['charging_window']=any(inside(a.tz_convert(settings.timezone),w.start,w.end) for w in settings.charging_windows)
             row['net_demand_kw']=row['load_point']-row['solar_point'];row['net_demand_low']=row['load_low']-row['solar_high'];row['net_demand_high']=row['load_high']-row['solar_low'];rows.append(row)
         soc=live.get('soc'); age=snapshot_age(live,now)
         trusted=bool(ready_load and ready_solar and battery_ready and inverter_ready and soc is not None and age<900)
@@ -233,14 +267,20 @@ class Forecaster:
         history['status']='Forecast available; coverage not established' if trusted else 'Awaiting calibrated models and current SoC'
         mapping={'low':10,'middle':50,'high':90}
         available,values,projections,imports,peak_indices,cutoff=project(settings,rows,soc,eta_c,eta_d,usage,trusted,periods)
+        if force or elapsed-self.history_at>=300:
+            try:
+                self.history_cache=chart_history(settings,now);self.history_at=elapsed
+            except Exception:
+                warnings.append('Recorded chart history is temporarily unavailable.')
+        actual_history=[r for r in self.history_cache if now-pd.Timedelta(hours=24)<=pd.Timestamp(r['time'])<now]
         chart=[{**row,**projections['low']['forecast'][i]} for i,row in enumerate(rows)]
         result={'updated_at':now.isoformat(),'valid_until':(now+pd.Timedelta(minutes=max(15,settings.battery_interval_minutes*3))).isoformat(),
                 'ready':trusted,'peak_active':export_active(now.tz_convert(settings.timezone),settings),
                 'percentiles':mapping,'percentile_basis':'Scenario labels only; see scenarios for separate solar/load input quantiles','horizon_hours':round((end-now).total_seconds()/3600,2),'scenarios':SCENARIOS,'energy_period_forecast':periods['periods'],'energy_period_basis':periods['basis'],'excess_kwh':available,'achievable_export_kwh':values,
                 'excess_percent':{k:round(v/settings.battery_capacity_kwh*100,2) for k,v in available.items()},
                 'achievable_export_percent':{k:round(v/eta_d/settings.battery_capacity_kwh*100,2) for k,v in values.items()},
-                'forecast':chart,'soc_projections':projections,
-                'export_policy':{'name':POLICY,'schedule':'Configured export-window discharge rate until the export energy limit is reached or the first export window ends','discharge_rate_kw':projections['middle']['discharge_rate_kw'],
+                'forecast':chart,'soc_projections':projections,'actual_history':actual_history,
+                'export_policy':{'name':POLICY,'schedule':'Every forecast export window uses its configured discharge rate and its own energy allowance, allocated in time order','discharge_rate_kw':projections['middle']['discharge_rate_kw'],
                     'safety_horizon_hours':round((end-now).total_seconds()/3600,2),'safety_end':end.isoformat(),'horizon_basis':'Safety checks use the complete configured forecast period',
                     'reserve_rule':'Retain configured minimum plus reserve at every forecast step',
                     'import_rule':'No household imports beyond configured charging-window allowances, including baseline imports',
@@ -254,5 +294,5 @@ class Forecaster:
                 'used_window_allowance_kwh':usage,
                 'energy_metric_basis':{'excess_kwh':'Stored battery energy above forecast household needs and configured minimum/reserve; not capped by export power or peak time',
                                        'achievable_export_kwh':'AC energy deliverable to the grid in the current/upcoming peak; limited by excess, discharge losses, inverter power and remaining time'},
-                'note':'Conservative uses P10 solar/P90 consumption per 12-hour block, middle P50/P50, optimistic P90/P10. Blocks are 06:00–18:00 and 18:00–06:00 local time. Each block follows the forecast hourly shape. A single trajectory per scenario determines its export allowance over the full forecast at the same fixed discharge rate. Shading spans scenarios under the same export target; it is not a probability interval.'}
+                'note':'Conservative uses P10 solar/P90 consumption per 12-hour block, middle P50/P50, optimistic P90/P10. Blocks are 06:00–18:00 and 18:00–06:00 local time. Each block follows the forecast hourly shape. A single trajectory per scenario determines its export allowance over the full forecast at the same fixed discharge rate. Every charging and export window is simulated; export allowances are allocated in time order. Shading spans scenarios under the same per-window export targets; it is not a probability interval.'}
         write_json('forecast',result); return result

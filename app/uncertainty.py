@@ -1,4 +1,5 @@
 """Asymmetric marginal draws, persistent hourly errors, fixed battery inputs."""
+from .config import solar_banks
 import numpy as np, pandas as pd
 
 METHOD='monte-carlo-v2'
@@ -75,7 +76,7 @@ def solar_dependence(metadata):
             'pairs':sum(m['pairs'] for m in usable),'issue_days':min(m['issue_days'] for m in usable)}
 
 
-def sample_components(settings,load_q,solar_qs,efficiency,seed=None,rho=None,solar_rho=None,times=None):
+def sample_components(settings,load_q,solar_qs,seed=None,rho=None,solar_rho=None,times=None):
     """Draw complete hourly paths. Cross-bank loading .8 remains an assumption."""
     from .config import read_json
     rng=np.random.default_rng(seed)
@@ -83,7 +84,7 @@ def sample_components(settings,load_q,solar_qs,efficiency,seed=None,rho=None,sol
     if rho is None:rho=read_json('model-load',{}).get('sampling_rho',0.)
     rho=float(np.clip(rho,0,.95))
     if solar_rho is None:
-        solar_rho=solar_dependence([read_json('model-solar-'+b.id,{}) for b in settings.banks])['rho']
+        solar_rho=solar_dependence([read_json('model-solar-'+b.id,{}) for b in solar_banks(settings)])['rho']
     solar_rho=float(np.clip(solar_rho,0,.95))
     load_paths=quantile_draws(load_q,_ar(rng,samples,n,rho,times=times))
     solar_paths=np.zeros((samples,n))
@@ -93,13 +94,12 @@ def sample_components(settings,load_q,solar_qs,efficiency,seed=None,rho=None,sol
         bank_active=np.asarray(bank['high'])>0
         z=.8*cloud+.6*_ar(rng,samples,n,solar_rho,bank_active,times)
         solar_paths+=quantile_draws(bank,z)
-    solar_paths*=efficiency
     return load_paths,solar_paths,{'method':METHOD,'samples':samples,'rho':rho,'solar_rho':solar_rho,
         'solar_correlation':{'basis':'Assumed shared cloud loading; same persistence for cloud and bank noise; independent of load','loading':.8,'latent_cross_bank':.64}}
 
 
-def sample(settings,load_q,solar_qs,efficiency,seed=None,rho=None,solar_rho=None,times=None):
-    load,solar,info=sample_components(settings,load_q,solar_qs,efficiency,seed,rho,solar_rho,times)
+def sample(settings,load_q,solar_qs,seed=None,rho=None,solar_rho=None,times=None):
+    load,solar,info=sample_components(settings,load_q,solar_qs,seed,rho,solar_rho,times)
     return load-solar,info
 
 
@@ -137,26 +137,25 @@ def evidence_signature(settings):
     """Bind aggregate evidence to model identities and sampler/settings in use."""
     from .config import read_json
     import hashlib,json
-    names=['load',*['solar-'+b.id for b in settings.banks],'battery','inverter']
-    models={name:{k:read_json('model-'+name,{}).get(k) for k in ('trained_at','sampling_rho','sampling_dependence','efficiency','charge_efficiency','discharge_efficiency')} for name in names}
+    names=['load',*['solar-'+b.id for b in solar_banks(settings)],'battery']
+    models={name:{k:read_json('model-'+name,{}).get(k) for k in ('trained_at','sampling_rho','sampling_dependence','charge_efficiency','discharge_efficiency')} for name in names}
     return hashlib.sha256(json.dumps({'method':METHOD,'settings':settings.model_dump(exclude={'ha_token'}),'models':models},sort_keys=True,default=str).encode()).hexdigest()
 
 
-def energy_scenarios(settings,rows,now,efficiency=None):
+def energy_scenarios(settings,rows,now):
     """Sample energy totals for the three fixed-shape battery scenarios."""
     from .config import read_json
     # Each hourly draw is held through all dispatch substeps of that hour.
     codes,unique=pd.factorize(pd.DatetimeIndex([r['time'] for r in rows]).floor('h'))
     hourly=[rows[int(np.flatnonzero(codes==i)[0])] for i in range(len(unique))]
     load_q={k:np.array([r['load_'+k] for r in hourly]) for k in ('low','middle','high')}
-    solar_qs=[{k:np.array([r.get(f'solar_{k}_{b.id}',0.) for r in hourly]) for k in ('low','middle','high')} for b in settings.banks]
-    inv=read_json('model-inverter',{}).get('efficiency',.9) if efficiency is None else efficiency
+    solar_qs=[{k:np.array([r.get(f'solar_{k}_{b.id}',0.) for r in hourly]) for k in ('low','middle','high')} for b in solar_banks(settings)]
     # Stable within an issue hour, so refreshing SoC does not redraw the band.
-    load,solar,info=sample_components(settings,load_q,solar_qs,inv,seed=int(pd.Timestamp(now).floor('h').timestamp())%2**32,times=unique)
+    load,solar,info=sample_components(settings,load_q,solar_qs,seed=int(pd.Timestamp(now).floor('h').timestamp())%2**32,times=unique)
     load=load[:,codes];solar=solar[:,codes]
     periods=energy_period_profiles(settings,rows,load,solar)
     load_meta=read_json('model-load',{})
-    solar_meta=[read_json('model-solar-'+b.id,{}) for b in settings.banks]
+    solar_meta=[read_json('model-solar-'+b.id,{}) for b in solar_banks(settings)]
     status={'method':METHOD,'status':'Forecast available; coverage not established','samples':info['samples'],'rho':info['rho'],
             'coverage':{'nominal':.8,'load_validation':bool(load_meta.get('load_validation')),'solar_validations':sum(bool(m.get('forecast_validation')) for m in solar_meta)},
             'solar_correlation':info['solar_correlation'],'solar_persistence':solar_dependence(solar_meta),

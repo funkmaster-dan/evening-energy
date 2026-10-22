@@ -1,9 +1,10 @@
-"""Direct load/solar models and measured battery/inverter calibration."""
+"""Direct load/solar models and measured battery calibration."""
 import warnings
+from pathlib import Path
 warnings.filterwarnings('ignore',message='X does not have valid feature names')
 import numpy as np, pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from .config import DATA, read_json, write_json
+from .config import DATA, read_json, write_json, solar_banks, solar_configuration
 from .datasets import SOLAR_PIPELINE
 from .load_splits import training_mask
 from .quality import LOAD_PIPELINE, QUALITY_POLICY, effective_policy
@@ -16,10 +17,12 @@ def validation_chart(index,y,p):
     return [{'time':str(index[i]),'actual':round(float(y[i]),3),'predicted':round(float(p[i]),3)} for i in range(0,len(y),step)]
 
 def train(settings,dataset_id,progress):
+    if dataset_id=='inverter':raise ValueError('Inverter calibration has been removed')
     summary=read_json('dataset-'+dataset_id)
     if not summary or not summary['sufficient']: raise ValueError('Build a sufficient dataset first.')
     if summary.get('quality',{}).get('policy')!=QUALITY_POLICY:raise ValueError('Prepare this dataset again for the current cleaning policy.')
     if read_json('candidate-'+dataset_id): raise ValueError('Promote or delete the existing candidate before calibrating again.')
+    if summary['kind']=='solar' and summary.get('bank_id') not in {b.id for b in solar_banks(settings)}: raise ValueError('Prepare a solar dataset for the current sensor mode')
     d=pd.read_pickle(DATA/(dataset_id+'.pkl')); f=d['frame']; kind=summary['kind']
     metadata={'trained_at':pd.Timestamp.now(tz='UTC').isoformat(),'dataset_id':dataset_id,'training_rows':summary['training_rows'],'validation_rows':summary['validation_rows'],'kind':kind,'quality_policy':QUALITY_POLICY,'bank_id':summary.get('bank_id'),'dataset_created_at':summary['created_at'],'config_signature':signature(settings,kind,summary.get('bank_id'))}
     if kind=='load':
@@ -28,6 +31,7 @@ def train(settings,dataset_id,progress):
         write_json('candidate-'+dataset_id,metadata)
         return metadata
     elif kind=='solar':
+        if summary.get('solar_configuration') != solar_configuration(settings,summary.get('bank_id')):raise ValueError('Solar settings have changed or this dataset predates configuration checks. Prepare data again.')
         from .solar_training import train_solar
         metadata=train_solar(settings,summary,d,metadata,progress)
         write_json('candidate-'+dataset_id,metadata)
@@ -59,34 +63,31 @@ def train(settings,dataset_id,progress):
             baseline=np.where(be<0,-be*current['charge_efficiency'],-be/current['discharge_efficiency'])[va]
         if not len(actual): raise ValueError('Need usable battery validation samples')
         y=de
-    else:
-        total=f[[b.entity for b in settings.banks]].sum(axis=1,min_count=len(settings.banks)); ct=f[settings.solar_ct_entity]
-        usable=(total>.5)&(ct>=0)&(ct/total>.3)&(ct/total<1.2)
-        tr=training_mask(f.index,d['start'],d['train_end'])&usable; va=(f.index>=d['val_start'])&usable
-        if tr.sum()<24: raise ValueError('Need at least 24 simultaneous daytime inverter and CT readings.')
-        eta=float(np.clip((ct[tr]/total[tr]).median(),.3,1.0)); pred=total[va].to_numpy()*eta
-        metadata.update(model='Inverter / CT efficiency calibration',efficiency=eta,metrics=metrics(ct[va],pred) if va.sum() else {},chart=validation_chart(f.index[va],ct[va].to_numpy(),pred))
-        baseline=None
-        if model_ready(settings,dataset_id,kind): baseline=total[va].to_numpy()*read_json('model-'+dataset_id)['efficiency']
-        if not va.sum(): raise ValueError('Need usable inverter validation samples')
-        y=ct
+    else:raise ValueError('Unsupported model type')
     metadata['validation_rows']=int(va.sum())
     metadata['validation_start']=d['val_start'].isoformat(); metadata['validation_end']=d['end'].isoformat()
     metadata['comparison']={'metrics':metrics(y.loc[va],baseline),'chart':validation_chart(f.index[va],y.loc[va].to_numpy(),baseline)} if baseline is not None else None
     write_json('candidate-'+dataset_id,metadata)
     return metadata
 
+def combined_configuration(settings):
+    return solar_configuration(settings,'__combined')
+
+
 def signature(settings,kind,bank_id=None):
     policy=effective_policy(settings,kind) if kind in ('load','solar') else {'quality_policy':QUALITY_POLICY}
     if kind=='solar':policy=effective_policy(settings,kind,read_json('dataset-solar-'+bank_id,{}).get('request',{}))
     if kind=='load': return {**policy,'load_pipeline':LOAD_PIPELINE,'quality_policy':QUALITY_POLICY,'weather_model':settings.weather_model,'load_max_power_kw':settings.load_max_power_kw,'quality_corrections':read_json('dataset-load',{}).get('request',{}).get('corrections',[]),'location':[settings.latitude,settings.longitude],'timezone':settings.timezone,'state':settings.state,'school_calendar_url':settings.school_calendar_url,'entities':settings.historical_consumption_entities}
     if kind=='solar':
-        b=next(b for b in settings.banks if b.id==bank_id)
-        return {**policy,'location':[settings.latitude,settings.longitude],'timezone':settings.timezone,'bank':b.model_dump(),'solar_pipeline':SOLAR_PIPELINE,'weather_model':settings.weather_model}
+        b=next(b for b in solar_banks(settings) if b.id==bank_id)
+        geometry={'combined':combined_configuration(settings),'mode':'combined-ac-v1'} if bank_id=='__combined' else {'bank':b.model_dump(exclude={'panel_count'})}
+        return {**policy,'location':[settings.latitude,settings.longitude],'timezone':settings.timezone,**geometry,'solar_pipeline':SOLAR_PIPELINE,'weather_model':settings.weather_model}
     if kind=='battery': return {**policy,'capacity':settings.battery_capacity_kwh,'power':settings.battery_power_entity,'soc':settings.battery_soc_entity}
-    return {**policy,'banks':[b.entity for b in settings.banks],'ct':settings.solar_ct_entity}
+    raise ValueError('Unsupported model type')
 
 def model_ready(settings,name,kind,bank_id=None):
+    if kind not in ('load','solar','battery'):return False
+    if kind=='solar' and bank_id not in {b.id for b in solar_banks(settings)}: return False
     meta=read_json('model-'+name)
     legacy=meta and ((kind=='solar' and meta.get('solar_pipeline')=='open-meteo-gti-angles-quantile-v2') or (kind=='load' and meta.get('pipeline')=='lightgbm-quantile-direct-v2'))
     if legacy:
@@ -95,9 +96,9 @@ def model_ready(settings,name,kind,bank_id=None):
         return old==current and all(p.exists() for p in artifact_paths(name))
     return bool(meta and (kind!='load' or meta.get('pipeline')==LOAD_PIPELINE) and meta.get('config_signature')==signature(settings,kind,bank_id) and all(p.exists() for p in artifact_paths(name)))
 
-def list_models(): return [read_json(p.stem) for p in sorted(DATA.glob('model-*.json'))]
+def list_models(): return [read_json(p.stem) for p in sorted(DATA.glob('model-*.json')) if p.stem!='model-inverter']
 
-def list_candidates(): return [read_json(p.stem) for p in sorted(DATA.glob('candidate-*.json'))]
+def list_candidates(): return [read_json(p.stem) for p in sorted(DATA.glob('candidate-*.json')) if p.stem!='candidate-inverter']
 
 def artifact_paths(dataset_id,candidate=False):
     name=dataset_id+('-candidate' if candidate else '')
@@ -109,6 +110,7 @@ def artifact_paths(dataset_id,candidate=False):
 def promote_candidate(settings,dataset_id):
     metadata=read_json('candidate-'+dataset_id)
     if not metadata: raise ValueError('Candidate not found')
+    if metadata.get('kind') not in ('load','solar','battery'):raise ValueError('Unsupported model type')
     if dataset_id=='load' and metadata.get('pipeline')!=LOAD_PIPELINE: raise ValueError('Rebuild and calibrate the load dataset first')
     if metadata['config_signature']!=signature(settings,metadata['kind'],metadata.get('bank_id')):
         raise ValueError('Configuration has changed. Delete this candidate and calibrate again.')
@@ -126,7 +128,14 @@ def promote_candidate(settings,dataset_id):
             predicted=LoadPredictor(artifact).predict(cases[0]['x'])
         else:
             from .solar_training import solar_predict
-            from .datasets import SOLAR_FEATURES
+            from .datasets import SOLAR_FEATURES,bank_features
+            if any(c.startswith('bank_irradiance_') and c not in frame for c in artifact.get('features',[])):
+                from .sources import solar_weather
+                bank=next(b for b in solar_banks(settings) if b.id==metadata['bank_id'])
+                weather=solar_weather(settings,bank,d['start'],d['end'],historical=True)
+                frame=frame.copy()
+                for c in weather.columns:
+                    if c.startswith('bank_irradiance_'):frame[c]=weather[c].reindex(frame.index)
             predicted=solar_predict(artifact,frame.dropna(subset=[c for c in SOLAR_FEATURES if c not in ('weather_run_age','lead_hours')]).iloc[-24:])
         if any(not np.isfinite(values).all() for values in predicted.values()):raise ValueError('Candidate predictions must be finite')
     for source,target in zip(sources,targets): source.replace(target)
@@ -141,33 +150,23 @@ def delete_candidate(dataset_id):
     for path in [*artifact_paths(dataset_id,True),DATA/('candidate-'+dataset_id+'.json')]: path.unlink(missing_ok=True)
 
 
-def migrate_uncertainty(settings):
-    """Preserve incompatible artifacts and requests before a policy upgrade.
-
-    Readiness uses signatures; old models remain available for rollback and paired
-    private evaluation until a reviewed candidate replaces them.
-    """
-    import tarfile,sqlite3,tempfile
-    marker='preparation-migration-'+QUALITY_POLICY
-    if read_json(marker):return
-    paths=[p for pattern in ('model-*.json','candidate-*.json','*.joblib','dataset-*.json','config.json') for p in DATA.glob(pattern)]
-    if paths:
-        backup_dir=DATA/'backups';backup_dir.mkdir(exist_ok=True)
-        backup=backup_dir/(marker+'-'+pd.Timestamp.now(tz='UTC').strftime('%Y%m%d-%H%M%S-%f')+'.tar.gz')
-        with tarfile.open(backup,'w:gz') as bundle:
-            for path in sorted(set(paths)):bundle.add(path,arcname=path.name)
-            if (DATA/'history.sqlite').exists():
-                with tempfile.TemporaryDirectory() as temp:
-                    copy=__import__('pathlib').Path(temp)/'history.sqlite'
-                    with sqlite3.connect(DATA/'history.sqlite') as source,sqlite3.connect(copy) as destination:source.backup(destination)
-                    bundle.add(copy,arcname='history.sqlite')
-        backup.chmod(0o600)
-    write_json(marker,{'completed_at':pd.Timestamp.now(tz='UTC').isoformat(),'policy':QUALITY_POLICY})
+def clear_outdated_preparations():
+    """A code update requires preparing data again; recorded history stays intact."""
+    updated=max(p.stat().st_mtime for p in Path(__file__).parent.glob('*.py'))
+    for path in DATA.glob('dataset-*.json'):
+        summary=read_json(path.stem,{})
+        name=summary.get('id')
+        if not name:continue
+        prepared=DATA/(name+'.pkl')
+        if prepared.exists() and prepared.stat().st_mtime>=updated:continue
+        for stale in (path,prepared,DATA/('candidate-'+name+'.json'),*artifact_paths(name,True)):
+            stale.unlink(missing_ok=True)
 
 
 def clean_model_storage(settings):
     """Keep active models and a reviewable candidate for configured models."""
-    names={'load','battery','inverter',*('solar-'+b.id for b in settings.banks)}
+    names={'load','battery','solar-__combined',*('solar-'+b.id for b in settings.banks)}
+    for name in ('dataset-inverter.json','inverter.pkl','inverter.joblib','inverter-candidate.joblib'):(DATA/name).unlink(missing_ok=True)
     keep=set()
     for name in names:
         for prefix,candidate in [('model-',False),('candidate-',True)]:

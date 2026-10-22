@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.0
+
+- Add combined solar production models using one measured AC sensor, panel counts and bank orientations.
+- Compare solar mean and median forecasts with physical and residual alternatives, with chronological uncertainty calibration and clearer validation reports.
+- Share data-preparation logic, exclude history before recorded readings begin, and detect stuck power readings while preserving normal nighttime zeros and full battery charge.
+- Remove the inverter-efficiency calibration model and its forecast multiplier.
+- Reorganize Settings into Basic settings, Live sensor data, Battery, Solar array, Time of use and Advanced cards.
+- Keep candidate-only validation separate from paired model comparisons and respect training cutoffs during filtering.
+- Clear outdated prepared datasets and pending candidates after code updates; recorded history, settings and active models are retained. Prepare data again before training.
+
 ## v1.1.0
 
 - Simulate every charging and export window in the forecast, with separate export allowances allocated in time order while protecting household needs and reserve.

@@ -5,41 +5,41 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from .config import Settings, load_settings, read_json, write_json
+from .config import Settings, load_settings, read_json, write_json, solar_banks
 from .sources import HomeAssistant, store_live
 from .ha_inputs import numeric_value, state_available, snapshot_age
 from .quality import physical, LOAD_PIPELINE, QUALITY_POLICY, effective_policy
 from .setup import inspect_setup
 from .datasets import build_dataset, list_datasets
-from .models import train, list_models, list_candidates, promote_candidate, delete_candidate, clean_model_storage, migrate_uncertainty
+from .models import train, list_models, list_candidates, promote_candidate, delete_candidate, clean_model_storage, clear_outdated_preparations
 from .forecast import Forecaster
 from .battery import POLICY, export_active
 
 log=logging.getLogger('energy-tool')
 settings=load_settings(); forecaster=Forecaster(); jobs={}; entities=[]; live={}; forecast=read_json('forecast',{}); last_error=None
-if forecast and (forecast.get('load_forecast_basis')!=LOAD_PIPELINE or forecast.get('quality_policy')!=QUALITY_POLICY or forecast.get('soc_band_method')!=POLICY or forecast.get('export_policy',{}).get('name')!=POLICY):forecast={}
+if forecast and ('inverter_efficiency' in forecast.get('calibration',{}) or forecast.get('load_forecast_basis')!=LOAD_PIPELINE or forecast.get('quality_policy')!=QUALITY_POLICY or forecast.get('soc_band_method')!=POLICY or forecast.get('export_policy',{}).get('name')!=POLICY):forecast={}
 busy=False; forecast_lock=asyncio.Lock()
 
 def refresh_live():
     global entities,live
     states=HomeAssistant(settings).states(); entities=states
     lookup={s['entity_id']:s for s in states}
-    store_live([s for s in states if s['entity_id'] in {settings.consumption_entity,settings.solar_ct_entity,settings.battery_soc_entity,settings.battery_power_entity,*[b.entity for b in settings.banks]}])
+    store_live([s for s in states if s['entity_id'] in {settings.consumption_entity,settings.solar_ct_entity,settings.battery_soc_entity,settings.battery_power_entity,*[b.entity for b in solar_banks(settings)]}])
     now=pd.Timestamp.now(tz='UTC')
     def value(entity,power=False):
         value=numeric_value(lookup.get(entity,{}),power)
         if not power or value is None:return value
         kind='battery_power' if entity==settings.battery_power_entity else 'load' if entity==settings.consumption_entity else 'solar'
         limit=max(settings.battery_charge_limit_kw,settings.battery_discharge_limit_kw)*1.2 if kind=='battery_power' else effective_policy(settings,kind)['max_power_kw']
-        bank=next((b for b in settings.banks if b.entity==entity),None)
+        bank=next((b for b in solar_banks(settings) if b.entity==entity),None)
         if bank:limit=effective_policy(settings,'solar',read_json('dataset-solar-'+bank.id,{}).get('request',{}))['max_power_kw']
         cleaned,_=physical(pd.Series([value]),kind,limit)
         return None if pd.isna(cleaned.iloc[0]) else float(cleaned.iloc[0])
     soc=value(settings.battery_soc_entity) if lookup.get(settings.battery_soc_entity,{}).get('attributes',{}).get('unit_of_measurement')=='%' else None
     if soc is not None and not 0<=soc<=100:soc=None
-    ids={settings.consumption_entity,settings.solar_ct_entity,settings.battery_soc_entity,settings.battery_power_entity,*[b.entity for b in settings.banks]}
+    ids={settings.consumption_entity,settings.solar_ct_entity,settings.battery_soc_entity,settings.battery_power_entity,*[b.entity for b in solar_banks(settings)]}
     inputs={entity:{'available':state_available(lookup.get(entity,{})),'state':lookup.get(entity,{}).get('state'),'last_changed':lookup.get(entity,{}).get('last_changed'),'last_updated':lookup.get(entity,{}).get('last_updated'),'last_reported':lookup.get(entity,{}).get('last_reported')} for entity in ids}
-    live={'soc':soc,'load_kw':value(settings.consumption_entity,True),'solar_kw':value(settings.solar_ct_entity,True),'battery_kw':value(settings.battery_power_entity,True),'soc_age_seconds':0,'updated_at':now.isoformat(),'freshness_basis':'Successful Home Assistant snapshot and entity availability; state timestamps show changes, not sensor expiry','inputs':inputs,'banks':[{'name':b.name,'power_kw':value(b.entity,True)} for b in settings.banks]}
+    live={'soc':soc,'load_kw':value(settings.consumption_entity,True),'solar_kw':value(settings.solar_ct_entity,True),'battery_kw':value(settings.battery_power_entity,True),'soc_age_seconds':0,'updated_at':now.isoformat(),'freshness_basis':'Successful Home Assistant snapshot and entity availability; state timestamps show changes, not sensor expiry','inputs':inputs,'banks':[{'name':b.name,'power_kw':value(b.entity,True)} for b in solar_banks(settings)]}
 
     return live
 
@@ -94,9 +94,9 @@ async def scheduler():
 @asynccontextmanager
 async def lifespan(app):
     global forecast
-    migrate_uncertainty(settings)
     settings.save()
     forecast={};write_json('forecast',{})
+    clear_outdated_preparations()
     clean_model_storage(settings)
     task=asyncio.create_task(scheduler())
     yield
@@ -180,7 +180,7 @@ def current_forecast():
 
 @app.get('/api/dashboard')
 def dashboard():
-    return {'candidates':list_candidates(),'forecast':current_forecast(),'live':{**live,'soc_age_seconds':snapshot_age(live),'ha_snapshot_age_seconds':snapshot_age(live)},'models':list_models(),'datasets':list_datasets(),'jobs':list(jobs.values())[-20:],'error':last_error,'busy':busy}
+    return {'candidates':list_candidates(),'forecast':current_forecast(),'live':{**live,'soc_age_seconds':snapshot_age(live),'ha_snapshot_age_seconds':snapshot_age(live)},'models':list_models(),'datasets':list_datasets(settings),'jobs':list(jobs.values())[-20:],'error':last_error,'busy':busy}
 
 @app.get('/api/forecast')
 def get_forecast(): return current_forecast()
@@ -198,17 +198,19 @@ async def refresh():
     except Exception as exc: raise HTTPException(400,str(exc))
 
 @app.get('/api/datasets')
-def datasets(): return list_datasets()
+def datasets(): return list_datasets(settings)
 
 @app.post('/api/datasets')
-async def build(body:dict): return start_job('Build '+body.get('kind','')+' dataset',lambda p:build_dataset(settings,body,p))
+async def build(body:dict):
+    if body.get('kind') not in ('load','solar','battery'):raise HTTPException(400,'Choose consumption, solar production or battery efficiency')
+    return start_job('Build '+body['kind']+' dataset',lambda p:build_dataset(settings,body,p))
 
 @app.get('/api/models')
 def models(): return list_models()
 
 @app.post('/api/train/{dataset_id}')
 async def calibration(dataset_id:str):
-    if dataset_id not in {d['id'] for d in list_datasets()}: raise HTTPException(404,'Dataset not found')
+    if dataset_id not in {d['id'] for d in list_datasets(settings)}: raise HTTPException(404,'Dataset not found')
     if read_json('candidate-'+dataset_id): raise HTTPException(409,'Promote or delete the existing candidate first.')
     return start_job('Calibrate '+dataset_id,lambda p:train(settings,dataset_id,p))
 

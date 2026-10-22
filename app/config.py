@@ -1,4 +1,5 @@
 import json, os
+from typing import Literal
 from datetime import datetime
 from pathlib import Path
 from pydantic import BaseModel, Field, model_validator
@@ -9,7 +10,8 @@ DATA.mkdir(parents=True, exist_ok=True)
 class Bank(BaseModel):
     id: str
     name: str
-    entity: str
+    entity: str = ''
+    panel_count: int = Field(default=1, ge=1)
     azimuth: float = Field(ge=0, le=360)
     tilt: float = Field(default=30, ge=0, le=90)
     history_start: str = Field(default='', pattern=r'^(\d{4}-\d{2}-\d{2})?$')
@@ -55,7 +57,7 @@ class Settings(BaseModel):
     battery_power_entity: str = 'sensor.battery_power'
     battery_soc_entity: str = 'sensor.battery_soc'
     solar_ct_entity: str = 'sensor.solar_power'
-    solar_ct_proxy: bool = False
+    solar_mode: Literal['individual', 'combined'] = 'individual'
     battery_capacity_kwh: float = Field(default=10, gt=0)
     battery_charge_limit_kw: float = Field(default=5, gt=0)
     battery_discharge_limit_kw: float = Field(default=5, gt=0)
@@ -75,6 +77,16 @@ class Settings(BaseModel):
             if 'charging_windows' in values: values['charging_windows']=[{**w,'charge_kw':None if w.get('charge_kw') is not None and w['charge_kw']>=maximum else w.get('charge_kw')} for w in values.get('charging_windows',[])]
         return values
 
+    @model_validator(mode='after')
+    def validate_solar(self):
+        if not self.banks or len({b.id for b in self.banks}) != len(self.banks):
+            raise ValueError('Add at least one panel bank with unique identifiers')
+        if any(b.id == '__combined' for b in self.banks):
+            raise ValueError('Reserved panel bank identifier')
+        if self.solar_mode == 'combined' and not self.solar_ct_entity.strip():
+            raise ValueError('Choose a combined solar production sensor')
+        return self
+
     def save(self):
         (DATA / 'config.json').write_text(self.model_dump_json(indent=2))
         (DATA / 'config.json').chmod(0o600)
@@ -82,6 +94,24 @@ class Settings(BaseModel):
     def public(self):
         d=self.model_dump(); d['ha_token']=''; d['token_configured']=bool(self.ha_token)
         return d
+
+def solar_banks(settings):
+    """Forecast/calibration targets: measured banks or one measured total."""
+    if settings.solar_mode == 'combined':
+        return [Bank(id='__combined', name='Combined solar production', entity=settings.solar_ct_entity, azimuth=0, history_start=max((b.history_start for b in settings.banks),default=''))]
+    return settings.banks
+
+
+def solar_configuration(settings,bank_id):
+    """Inputs that determine prepared solar features and eligible panel history."""
+    context={'version':2,'location':[settings.latitude,settings.longitude],'timezone':settings.timezone,'weather_model':settings.weather_model,'mode':settings.solar_mode}
+    if bank_id=='__combined':
+        if settings.solar_mode!='combined':raise ValueError('Choose a solar model for the current sensor mode')
+        return {**context,'sensor':settings.solar_ct_entity,'banks':[{'id':b.id,'panel_count':b.panel_count,'azimuth':b.azimuth,'tilt':b.tilt,'history_start':b.history_start} for b in settings.banks]}
+    bank=next((b for b in solar_banks(settings) if b.id==bank_id),None)
+    if bank is None:raise ValueError('Choose a solar model for the current sensor mode')
+    return {**context,'bank':bank.model_dump(exclude={'panel_count'})}
+
 
 def load_settings():
     p=DATA / 'config.json'

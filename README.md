@@ -24,10 +24,10 @@ The app forecasts and reports. **It never sends commands to your battery.**
 | **Models** | Prepare recorded history, train a candidate, inspect data quality and validation results, then decide whether to use it. |
 | **Settings** | Connect Home Assistant, select sensors, place your home on a map, configure panel banks and battery limits, and manage charging/export windows. |
 
-- **Consumption and solar forecasts:** separate LightGBM models for home use and each solar panel orientation, with P10/P50/P90 hourly uncertainty estimates.
+- **Consumption and solar forecasts:** LightGBM models for home use and solar production, using individual bank sensors or one combined sensor, with P10/P50/P90 hourly uncertainty estimates.
 - **History and forecasts together:** both charts include the previous 24 hours of recorded Home Assistant consumption, solar and battery charge, with a clear forecast boundary. Recent-past temperature comes from Open-Meteo model data, not an on-site thermometer.
 - **Compact forecast summaries:** cumulative consumption, solar, export and grid-import totals use 24-hour steps through the selected horizon. Summaries sit beside charts on wide screens and underneath on smaller screens. Temperature has its own °C axis; hover or tap to inspect aligned readings and forecasts.
-- **Battery planning:** calibrated charge/discharge and inverter efficiencies, usable capacity, minimum charge, an additional reserve, and scheduled grid charging.
+- **Battery planning:** calibrated battery charge/discharge efficiencies, usable capacity, minimum charge, an additional reserve, and scheduled grid charging.
 - **Multiple daily windows:** separate charging and export windows, including overnight windows and optional custom power rates.
 - **Local storage and training:** settings, recorded history, prepared datasets and trained models stay in your mounted data directory. Forecasts use Home Assistant and external weather/calendar services.
 - **Home Assistant reporting:** the separate [Energy Excess integration](https://github.com/funkmaster-dan/ha-energy-excess) exposes the results as sensors for dashboards and your own automations.
@@ -55,10 +55,10 @@ podman-compose up -d --build
 Open **Settings**:
 
 1. Create a Home Assistant **long-lived access token** from your user profile. Enter your HA URL and token, save, then use **Check saved connection**.
-2. Select live home consumption, battery charge/discharge power, battery state of charge, and solar output sensors. Models defaults to these saved live sensors; select additional historical sources there if a sensor has been replaced.
+2. Select live home consumption, battery charge/discharge power, battery state of charge, and solar output sensors. Models defaults to these saved live sensors; select additional historical sources there if a sensor has been replaced. Use history from the current physical panel layout for solar training; more history is useful only when it describes that layout.
 3. Set your location using the map or latitude/longitude fields. Choose your timezone, Australian state or territory, weather model and forecast length, from **24 to 72 hours**.
 4. Enter usable battery capacity, charge/discharge limits, minimum state of charge and additional reserve.
-5. Add one solar bank per panel orientation, selecting its production sensor, azimuth and tilt. Panel capacity is estimated during calibration.
+5. Add one solar bank per panel orientation, with its azimuth and tilt. Choose **Individual bank sensors** to select a production sensor for each bank, or **Combined solar sensor** to use the live Solar output sensor for total AC production and enter each bank’s panel count. Panel counts assume comparable panels; no capacity entry is needed. The combined sensor must exclude battery discharge.
 6. Configure charging and export windows to match your tariff and battery automation, then **Save settings**.
 
 The map supports clicking and dragging the marker; coordinate fields remain available if the map cannot load. Sensor checks distinguish live inputs from history-only sources and recognize unavailable solar readings at night. A connection check confirms access to HA; review the sensor checks as well.
@@ -67,7 +67,7 @@ Defaults are examples. Replace them with your own sensors, battery specification
 
 ### 2. Prepare history and train
 
-Open **Models** and select home consumption, a solar bank, battery efficiency or solar inverter efficiency:
+Open **Models** and select home consumption, a solar bank (or combined solar production) or battery efficiency:
 
 1. Choose separate training and validation dates and check the selected sensors. Defaults use the live sensors saved in Settings; add older replacement sensors here when needed. Suggestions use recent recorded history, and saved dataset dates are retained when you return to a model. Set **Maximum valid power** here to exclude implausible readings from a dataset.
 2. Click **Prepare data**. Review coverage, the prepared-history chart and **Data quality and history coverage**.
@@ -75,7 +75,7 @@ Open **Models** and select home consumption, a solar bank, battery efficiency or
 4. Review the candidate’s errors and measured-versus-predicted chart. Where a compatible active model exists, both are compared on the same validation periods.
 5. Choose **Use candidate** to activate it, or **Delete candidate** to keep the active model. The first model also requires explicit activation.
 
-Repeat for consumption, each solar bank, battery efficiency and inverter efficiency. The app keeps one active model and one pending candidate per model; resolve a candidate before training another.
+Repeat for consumption, each solar bank (or **Solar · Combined production**) and battery efficiency. Combined mode trains one model against measured total AC production, with panel-count-weighted sunlight inputs for all orientations. Changing solar sensors, location, timezone, weather model, panel counts, geometry or production-history cutoffs requires preparing the solar dataset again. Changes that affect a model invalidate its calibration signature, including combined-mode history cutoffs. Individual bank contributions are not measured in this mode. The app keeps one active model and one pending candidate per model; resolve a candidate before training another. Solar training compares hourly median and mean/energy point forecasts, including a shared irradiance baseline and a small residual alternative. Combined mode retains separate panel-count-weighted sunlight inputs for each orientation. Short histories use a smaller search and earlier chronological blocks for uncertainty adjustment; the Models page explicitly reports when independent calibration evidence is insufficient.
 
 ![Prepared history, coverage and training readiness in the Models page](docs/images/training-data.png)
 
@@ -92,9 +92,9 @@ Start with at least **seven training days and four validation days** for consump
 | **Solar bank production** | PV power for that orientation. Choose individual string sensors or their combined sensor without counting both. |
 | **Battery I/O power** | One signed charge/discharge power sensor in W or kW. Calibration determines the sign convention. |
 | **Battery state of charge** | Charge percentage for the same battery. Capacity must describe the usable energy represented by this sensor. |
-| **Solar output / AC monitoring** | Independent solar AC or CT power when available. If using PV production as a proxy, select the proxy option; inverter calibration and achievable export are approximate. |
+| **Solar output / AC monitoring** | Solar-only AC production in W or kW, excluding battery discharge. Combined mode uses this measurement as its training target. |
 
-Battery and inverter preparation show sensor roles explicitly. Select battery power and charge percentage for battery calibration, and PV inputs plus solar output for inverter calibration. Avoid an inverter total-output sensor that includes battery discharge when measuring solar AC production.
+Battery preparation shows sensor roles explicitly. Select battery power and charge percentage for battery calibration. Solar forecasts use measured production directly, without a separate inverter calibration model or conversion multiplier. Avoid an inverter total-output sensor that includes battery discharge when measuring solar AC production.
 
 For changed or removed panels, set the bank’s **Production history starts** date to the beginning of the current layout. Earlier readings are excluded for that bank.
 
@@ -166,11 +166,11 @@ For custom consumers, the app exposes:
 
 Home consumption and each solar bank use separate LightGBM models. Consumption learns weather, Australian calendar patterns and measured context available before forecast issue time. Solar learns weather and bank-specific tilted irradiance with sun position and lead-time features. A selected point estimate drives consumption totals; separate P10/P50/P90 heads supply uncertainty.
 
-Calibration uses chronological fitting and validation, including issued-weather replays where supported. Review energy errors as well as hourly errors. Historical comparisons are retrospective evidence; training alone does not establish better future accuracy.
+Calibration uses chronological fitting and validation, including issued-weather replays where supported. Review energy errors as well as hourly errors. Solar headline power errors use measured daylight; nighttime errors are separate. Validation reports distinct target hours alongside overlapping forecast/target pairs, P90 exceedances by lead time, and a full-period chart using the latest issue for each target. Repeated forecasts are not independent measurements. Historical comparisons are retrospective evidence; training alone does not establish better future accuracy.
 
 The sampler combines the marginal heads into complete hourly paths and estimates block energy quantiles. It preserves asymmetric bounds and solar darkness, with learned temporal persistence where available and assumed cross-bank cloud correlation. New installations default to **5,000 uncertainty samples**; existing saved settings remain in use. More samples reduce numerical sampling variation, not model error. Adding hourly P90 values does not produce a P90 daily total.
 
-Preparation retains source coverage and missing periods. Consumption gaps remain empty. Fully dark missing solar intervals can become derived zeros; limited daylight interpolation is tracked separately and receives reduced fitting weight. Invalid and corroborated frozen readings are rejected. Expand the quality and validation details in **Models** to inspect coverage, exclusions, energy errors and uncertainty diagnostics.
+Preparation retains source coverage and missing periods. Consumption gaps remain empty. Fully dark missing solar intervals can become derived zeros; limited daylight interpolation is tracked separately and receives reduced fitting weight. Stuck power means unchanged readings; even sub-watt variations break the run. Only floating-point precision is ignored. Solar values held into darkness, solar zeros lasting at least 24 hours including daylight, and consumption power held for at least 24 hours are excluded unless retained min/max show real variation. Normal night zeros, short daytime clipping and a battery held at 100% charge remain valid. Steady battery power is checked against changes in charge rather than rejected for being constant. Expand the quality and validation details in **Models** to inspect coverage, exclusions, energy errors and uncertainty diagnostics.
 
 ## Run and maintain
 
@@ -220,3 +220,5 @@ Weather and tilted irradiance come from [Open-Meteo](https://open-meteo.com/); s
 ## License
 
 [MIT](LICENSE). See the [changelog](CHANGELOG.md) for release notes.
+
+After an application code update, startup removes older prepared datasets and their pending candidates. Prepare data again before training. Recorded history, saved settings and active models are retained.

@@ -11,7 +11,7 @@ from .config import DATA,read_json
 from .datasets import FEATURES
 from .forecast_policy import FEATURE_SCHEMA,ordered,model_columns,SETTLEMENT_HOURS
 from .load_splits import training_mask
-from .quality import LOAD_PIPELINE,LEGACY_LOAD_PIPELINE,QUALITY_POLICY
+from .quality import LOAD_PIPELINE,LEGACY_LOAD_PIPELINE,QUALITY_POLICY,flat_run_known_at
 
 LOAD_FEATURES=FEATURES+['month','lead_hours','heating','cooling']+[f'lag{h}' for h in (1,2,3,24,48,168)]+[f'mean{h}' for h in (3,6,24,168)]+['std24']+[f'clock{d}' for d in (1,2,7,14)]+['clock_profile','weather_run_age']
 PARAMETERS=dict(boosting_type='gbdt',objective='quantile',n_estimators=max(1,int(os.getenv('ENERGY_TRAIN_TREES','1000'))),learning_rate=.03,max_bin=255,reg_lambda=2.,subsample=.9,subsample_freq=1,colsample_bytree=.9,random_state=42,n_jobs=max(1,int(os.getenv('ENERGY_TRAIN_THREADS','2'))),deterministic=True,force_col_wise=True,verbosity=-1)
@@ -82,13 +82,13 @@ def feature_rows(frame,origin,hours,timezone,profile_days=28,omit=(),_quality_ap
         events=frame.attrs.get('quality_runs',[])
         affected=set()
         for event in events:
-            if event.get('reason')!='implausible_flat_load':continue
+            if event.get('reason') not in ('implausible_flat_load','frozen_power_run'):continue
             left=pd.Timestamp(event['start']);right=pd.Timestamp(event['end'])
             affected.update(np.flatnonzero((origins>=left)&(origins<=right+pd.Timedelta(days=max(profile_days,14)+3))).tolist())
         # Many origins have the same known corrections. Rebuild those rows in
         # one vectorized pass instead of recursively rebuilding every origin.
-        runs=[event for event in events if event.get('reason')=='implausible_flat_load']
-        known=[pd.Timestamp(event['start'])+pd.Timedelta(hours=int(np.floor(max(12,3*event.get('normal_repeat_p99_hours',0))))+1) for event in runs]
+        runs=[event for event in events if event.get('reason') in ('implausible_flat_load','frozen_power_run')]
+        known=[flat_run_known_at(event) for event in runs]
         groups={}
         for j in sorted(affected):groups.setdefault(tuple(origins[j]>=at for at in known),[]).append(j)
         for state,indices in groups.items():
@@ -108,7 +108,7 @@ def feature_rows(frame,origin,hours,timezone,profile_days=28,omit=(),_quality_ap
                     else:combined_mask.loc[mask]=True;context.loc[mask]=np.nan
                 else:
                     # Historical exclusions were not yet known to this issue.
-                    restore=mask&prefix.get('quality_flags',pd.Series('',index=prefix.index)).isin(['implausible_flat_load','sensor_fault'])
+                    restore=mask&prefix.get('quality_flags',pd.Series('',index=prefix.index)).isin(['implausible_flat_load','frozen_power_run','sensor_fault'])
                     prefix.loc[restore,'train_eligible']=True
             if sources is not None:
                 from .datasets import splice

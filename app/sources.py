@@ -43,7 +43,7 @@ class HomeAssistant:
 
     def frame(self, entities, start, end, period='hour', progress=lambda s:None, units=None, corrections=None, quality_cutoff=None, measurement_kind=None, max_power_kw=None):
         """Statistics first; fill individual retained-history gaps with explicit provenance."""
-        from .quality import clean_sensor,physical
+        from .quality import clean_sensor,physical,apply_corrections
         states={x['entity_id']:x for x in self.states()}
         try: metadata={x['statistic_id']:x for x in self.ws({'type':'recorder/list_statistic_ids'})}
         except Exception:metadata={}
@@ -118,14 +118,7 @@ class HomeAssistant:
             original_flags=flags.copy()
             if kind=='load':
                 edits=corrections if corrections is not None else read_json('dataset-load',{}).get('request',{}).get('corrections',[])
-                for edit in edits:
-                    left=pd.Timestamp(edit['start']);right=pd.Timestamp(edit['end'])
-                    if left.tzinfo is None:left=left.tz_localize(self.s.timezone)
-                    if right.tzinfo is None:right=right.tz_localize(self.s.timezone)
-                    selected=(clean.index>=left)&(clean.index<right)
-                    if edit.get('action')=='restore':
-                        valid,_=physical(s,kind,limit);selected &= valid.notna()&original_flags.isin(['','spike_review','noise_normalized','implausible_flat_load']);clean.loc[selected]=valid.loc[selected];flags.loc[selected]='reviewed_restore'
-                    else:clean.loc[selected]=np.nan;flags.loc[selected]='reviewed_exclusion'
+                clean,flags=apply_corrections(s,clean,flags,self.s,kind,limit,edits,original_flags)
             cols[entity]=clean
             info[entity]={'unit':unit,'stored_unit':meta.get('statistics_unit_of_measurement'),'source_unit':source_unit,'normalized_unit':'%' if kind=='soc' else 'kW','unit_override':override,'unit_basis':'explicit statistics API units' if known_unit else 'explicit entity override for returned statistics','history_units':history_units,'history_errors':history_errors,'original_quality_flags':original_flags,'durations':pd.concat(duration_frames) if duration_frames else None,'raw_values':s.copy(),'coverage':coverage,'quality_flags':flags,'statistics':records_frame,'details':details}
         result=pd.DataFrame(cols,index=grid);result.attrs={'sensors':info,'raw':pd.DataFrame(raw_cols,index=grid),'evidence_limit':'Raw history only where retained by recorder; expired gaps remain missing'}
@@ -237,7 +230,15 @@ def forecast_weather(settings,start,end,model='ecmwf_ifs'):
 
 
 def solar_weather(settings,bank,start,end,historical=False,issued_at=None):
-    """Bank-specific Open-Meteo GTI, with archived runs for honest forecast replay."""
+    """Open-Meteo GTI for a bank or panel-count-weighted combined layout."""
+    if bank.id == '__combined':
+        frames=[(b,solar_weather(settings,b,start,end,historical=historical,issued_at=issued_at)) for b in settings.banks]
+        result=frames[0][1].copy()
+        count=sum(b.panel_count for b,_ in frames)
+        for i,(b,f) in enumerate(frames):result[f'bank_irradiance_{i}']=f['tilted_irradiance']*b.panel_count/count
+        result['tilted_irradiance']=result[[f'bank_irradiance_{i}' for i in range(len(frames))]].sum(axis=1,min_count=len(frames))
+        result.attrs={**frames[0][1].attrs,'irradiance_source':'Panel-count-weighted Open-Meteo tilted irradiance'}
+        return result
     start=pd.Timestamp(start); end=pd.Timestamp(end)
     # Allow for global-model publication after initialization, rather than using
     # a run whose results would not yet have been available at the issue time.

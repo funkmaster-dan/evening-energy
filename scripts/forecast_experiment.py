@@ -5,7 +5,7 @@ remains in private data storage; the command never publishes household results.
 """
 import argparse,json,time
 import numpy as np,pandas as pd
-from app.config import load_settings,DATA,read_json,write_json
+from app.config import load_settings,DATA,read_json,write_json,solar_banks
 from app.forecast_policy import issue_store,SETTLEMENT_HOURS
 
 def settle(settings):
@@ -17,7 +17,9 @@ def settle(settings):
     for kind in sorted({row[1] for row in issues}):
         selected=[r for r in issues if r[1]==kind];targets=sorted({t for r in selected for t in json.loads(r[3])['hours'] if pd.Timestamp(t)+pd.Timedelta(hours=1)<=now})
         if not targets:continue
-        bank=next((b for b in settings.banks if kind=='solar-'+b.id),None);entities=[bank.entity] if bank else settings.historical_consumption_entities
+        bank=next((b for b in solar_banks(settings) if kind=='solar-'+b.id),None)
+        if kind!='load' and bank is None:continue
+        entities=[bank.entity] if bank else settings.historical_consumption_entities
         policy=effective_policy(settings,'solar' if bank else 'load',read_json('dataset-'+kind,{}).get('request',{}))
         f=HomeAssistant(settings).frame(entities,pd.Timestamp(targets[0]),pd.Timestamp(targets[-1])+pd.Timedelta(hours=1),measurement_kind='solar' if bank else 'load',max_power_kw=policy['max_power_kw'],units=policy['units'],corrections=policy['corrections'])
         raw=splice(f,entities,read_json('dataset-'+kind,{}).get('request',{}).get('combine','splice'))
@@ -63,7 +65,7 @@ def main():
         result=aggregate(settings);print(json.dumps({k:v for k,v in result.items() if k not in ('candidate','existing')},indent=2));return
     if args.mode=='calibrate':
         from app.models import train,promote_candidate
-        names=args.models or ['load',*['solar-'+b.id for b in settings.banks]]
+        names=args.models or ['load',*['solar-'+b.id for b in solar_banks(settings)]]
         for name in names:
             train(settings,name,lambda message:print(message,flush=True))
             if args.promote:promote_candidate(settings,name)

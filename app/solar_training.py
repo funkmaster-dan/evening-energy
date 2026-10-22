@@ -32,7 +32,8 @@ def solar_predict(artifact,x,records=(),origin=None):
     cutoff=artifact.get('irradiance_cutoff',0) if modern else 5
     if cutoff:dark=dark|(x.tilted_irradiance.to_numpy()<cutoff)
     q=ordered(raw,x.get('lead_hours'),artifact.get('calibration') if modern else None,dark)
-    q['point']=ordered(raw,dark=dark)['middle']
+    point_model=artifact.get('mean_model') if modern and artifact.get('point_method',{}).get('head')=='mean' else None
+    q['point']=np.maximum(0,point_model.predict(x.reindex(columns=model_columns(point_model,LEGACY_SOLAR_FEATURES)))) if point_model is not None else ordered(raw,dark=dark)['middle']
     q['base_point']=q['point'].copy()
     if modern and origin is not None:q['point']*=recent_correction(records,origin,x.lead_hours,artifact.get('correction'),True)
     q['point'][dark]=0; q['base_point'][dark]=0
@@ -143,7 +144,7 @@ def solar_cases(settings,bank,d,progress=lambda s:None):
         progress(f'Checking solar issue weather: {bank.name} {local.date()}')
         try:
             weather=solar_weather(settings,bank,index[0],finish.ceil('h'),issued_at=origin)
-            x=bank_features(weather.reindex(index),bank,settings)
+            x=bank_features(weather.reindex(index),bank,settings,origin)
             if x.isna().any().any():raise ValueError('Incomplete archived forecast weather')
         except Exception as exc:
             skipped.append({'issue_time':origin.isoformat(),'reason':'Archived weather unavailable: '+str(exc)});continue

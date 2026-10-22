@@ -1,4 +1,5 @@
 """Home Assistant setup checks and history-based dataset date suggestions."""
+from .config import solar_banks
 from datetime import timedelta
 import pandas as pd
 import pvlib
@@ -90,7 +91,7 @@ def inspect_setup(settings, ha=None, now=None):
     specs.extend((f'history:{i}', 'Consumption history source', entity, POWER_UNITS|{'Wh','kWh'}, False)
                  for i, entity in enumerate(settings.historical_consumption_entities) if entity)
     specs.extend((f'bank:{bank.id}', f'Solar bank: {bank.name}', bank.entity, POWER_UNITS, True)
-                 for bank in settings.banks)
+                 for bank in solar_banks(settings))
     unique = list(dict.fromkeys(entity for _, _, entity, _, _ in specs if entity))
     battery_ids = [entity for entity in (settings.battery_power_entity, settings.battery_soc_entity) if entity]
     hourly_ids = [entity for entity in unique if entity not in battery_ids]
@@ -132,10 +133,7 @@ def inspect_setup(settings, ha=None, now=None):
                         'last': max(item['last'] for item in available)}
             suggestions['load'] = _suggestion(['combined'], {'combined': combined}, now, settings.timezone, 28, 365*5)
     suggestions.setdefault('load', {'reason': 'No consumption history was found in the last 30 days.'})
-    for bank in settings.banks:
+    for bank in solar_banks(settings):
         suggestions[f'solar:{bank.id}'] = _suggestion([bank.entity], coverage, now, settings.timezone, 10, 30)
     suggestions['battery'] = _suggestion(battery_ids, coverage, now, settings.timezone, 3, 14)
-    suggestions['inverter'] = _suggestion([*[bank.entity for bank in settings.banks], settings.solar_ct_entity],
-                                         coverage, now, settings.timezone, 3, 14)
-    return {'roles': roles, 'suggestions': suggestions, 'window_days': 30,'load_history_years':5,'load_suggestion_basis':'Recorder coverage only; preparation verifies normal-use complete forecast windows before fitting',
-            'solar_ct_proxy': settings.solar_ct_proxy}
+    return {'roles': roles, 'suggestions': suggestions, 'window_days': 30,'load_history_years':5,'load_suggestion_basis':'Recorder coverage only; preparation verifies normal-use complete forecast windows before fitting'}

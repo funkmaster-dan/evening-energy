@@ -1,10 +1,10 @@
 import json
 from datetime import datetime
 import numpy as np, pandas as pd, pvlib
-from .config import DATA, write_json, read_json
+from .config import DATA, write_json, read_json, solar_banks, solar_configuration
 from .sources import HomeAssistant, Weather, Calendar, solar_weather
 from .load_splits import inventory, recommendations, training_mask, split_coverage
-from .quality import QUALITY_POLICY, LOAD_PIPELINE, quality_frame, dark_hours, physical, battery_quality, target_bounds, load_context_metadata, attach_load_context, effective_policy
+from .quality import QUALITY_POLICY, LOAD_PIPELINE, quality_frame, dark_hours, physical, battery_quality, target_bounds, load_context_metadata, attach_load_context, effective_policy, history_availability, exclusion_report
 
 FEATURES=['temperature_2m','shortwave_radiation','hour_sin','hour_cos','year_sin','year_cos','weekday','weekend','public_holiday','school_holiday','school_calendar_known']
 LEGACY_SOLAR_FEATURES=['temperature_2m','shortwave_radiation','tilted_irradiance','hour_sin','hour_cos','year_sin','year_cos','solar_elevation','solar_azimuth']
@@ -25,26 +25,30 @@ def dataset_preview(series):
                        'available_readings':len(valid),'expected_readings':len(part)})
     return {'preview':points,'preview_hours':hours,'preview_version':PREVIEW_VERSION}
 
-def features(weather, settings, calendar):
-    f=weather.copy(); local=f.index.tz_convert(settings.timezone)
-    hour=local.hour+local.minute/60
-    f['hour_sin']=np.sin(hour*2*np.pi/24); f['hour_cos']=np.cos(hour*2*np.pi/24)
-    f['year_sin']=np.sin(local.dayofyear*2*np.pi/365.25); f['year_cos']=np.cos(local.dayofyear*2*np.pi/365.25)
-    f['weekday']=local.dayofweek; f['weekend']=(local.dayofweek>=5).astype(int)
+def time_features(frame,settings):
+    """Use the same local hour/year encoding for consumption and solar."""
+    f=frame.copy();local=f.index.tz_convert(settings.timezone);hour=local.hour+local.minute/60
+    f['hour_sin']=np.sin(hour*2*np.pi/24);f['hour_cos']=np.cos(hour*2*np.pi/24)
+    f['year_sin']=np.sin(local.dayofyear*2*np.pi/365.25);f['year_cos']=np.cos(local.dayofyear*2*np.pi/365.25)
+    return f
+
+
+def features(weather,settings,calendar):
+    f=time_features(weather,settings);local=f.index.tz_convert(settings.timezone)
+    f['weekday']=local.dayofweek;f['weekend']=(local.dayofweek>=5).astype(int)
     return f.join(calendar.features(f.index))
 
 def bank_features(f, bank, settings, origin=None):
     # Open-Meteo supplies tilted irradiance. pvlib is used only for sun position.
     position=pvlib.solarposition.get_solarposition(f.index+pd.Timedelta(minutes=30),settings.latitude,settings.longitude)
-    x=f[['temperature_2m','shortwave_radiation','tilted_irradiance']].copy()
-    local=f.index.tz_convert(settings.timezone); hour=local.hour+local.minute/60
-    x['hour_sin']=np.sin(hour*2*np.pi/24); x['hour_cos']=np.cos(hour*2*np.pi/24)
-    x['year_sin']=np.sin(local.dayofyear*2*np.pi/365.25); x['year_cos']=np.cos(local.dayofyear*2*np.pi/365.25)
+    x=time_features(f[['temperature_2m','shortwave_radiation','tilted_irradiance']],settings)
     x['solar_elevation']=position.apparent_elevation.to_numpy(); x['solar_azimuth']=position.azimuth.to_numpy()
     x['full_dark']=dark_hours(settings,f.index).astype(float)
     x['lead_hours']=np.asarray((f.index-pd.Timestamp(origin)).total_seconds()/3600) if origin is not None else np.nan
     run=f.attrs.get('run');x['weather_run_age']=(pd.Timestamp(origin)-pd.Timestamp(run)).total_seconds()/3600 if origin is not None and run else np.nan
-    return x[SOLAR_FEATURES]
+    for column in f.columns:
+        if column.startswith('bank_irradiance_'):x[column]=f[column]
+    return x[SOLAR_FEATURES+[c for c in x.columns if c.startswith('bank_irradiance_')]]
 
 def splice(frame, entities, mode='splice'):
     f=frame.reindex(columns=entities);f.attrs={}
@@ -53,8 +57,11 @@ def splice(frame, entities, mode='splice'):
     return f.iloc[:,::-1].bfill(axis=1).iloc[:,0]
 
 def build_dataset(settings, req, progress):
-    kind=req['kind']; dataset_id=kind if kind in ('load','battery','inverter') else 'solar-'+req['bank_id']
-    bank=next((b for b in settings.banks if b.id==req.get('bank_id')),None) if kind=='solar' else None
+    kind=req['kind']
+    if kind not in ('load','solar','battery'):raise ValueError('Choose consumption, solar production or battery efficiency')
+    dataset_id=kind if kind in ('load','battery') else 'solar-'+req['bank_id']
+    bank=next((b for b in solar_banks(settings) if b.id==req.get('bank_id')),None) if kind=='solar' else None
+    if kind=='solar' and bank is None: raise ValueError('Choose a solar model for the current sensor mode')
     if bank and bank.history_start:
         req={**req,'train_start':max(req['train_start'],bank.history_start)}
     start=pd.Timestamp(req['train_start'],tz=settings.timezone).tz_convert('UTC')
@@ -66,7 +73,6 @@ def build_dataset(settings, req, progress):
     entities=req.get('entities',[])
     if not entities: raise ValueError('Select at least one relevant Home Assistant sensor.')
     if kind=='battery': entities=list(dict.fromkeys(entities+[settings.battery_power_entity,settings.battery_soc_entity]))
-    if kind=='inverter': entities=list(dict.fromkeys(entities+[b.entity for b in settings.banks]+[settings.solar_ct_entity]))
     ha=HomeAssistant(settings)
     context_start=start-pd.Timedelta(days=58) if kind=='load' else start
     if req.get('unit') and len(entities)>1:raise ValueError('Use per-entity units for multiple sources')
@@ -115,7 +121,8 @@ def build_dataset(settings, req, progress):
                 flags=raw.attrs['sensors'][entity]['quality_flags'].reindex(expected)
                 selected=source.eq('')&source_flags.eq('missing')&~flags.isin(['','missing'])&flags.notna()
                 source_flags.loc[selected]=flags.loc[selected]
-        quality,details=quality_frame(raw_target,settings,kind,limit,source,train_end,req.get('corrections') if kind=='solar' else None,minmax=target_bounds(raw,entities,req.get('combine','splice')),precleaned=(target,source_flags))
+        bounds=target_bounds(raw,entities,req.get('combine','splice'))
+        quality,details=quality_frame(raw_target,settings,kind,limit,source,train_end,req.get('corrections') if kind=='solar' else None,minmax=bounds,precleaned=(target,source_flags))
         for entity in entities:
             selected=source.eq(entity)
             original_flags=raw.attrs.get('sensors',{}).get(entity,{}).get('original_quality_flags')
@@ -135,7 +142,7 @@ def build_dataset(settings, req, progress):
             quality=derive_solar(quality,settings,start,train_end,int(req.get('interpolate_hours',1)),limit)
         # Preserve a full expected grid, including missing context and targets.
         cleaned=f.join(quality)
-        bounds=target_bounds(raw,entities,req.get('combine','splice'));cleaned['sensor_min']=bounds['min'];cleaned['sensor_max']=bounds['max']
+        cleaned['sensor_min']=bounds['min'];cleaned['sensor_max']=bounds['max']
         cleaned['train_eligible'] &= cleaned[FEATURES if kind=='load' else LEGACY_SOLAR_FEATURES].notna().all(axis=1)
         cleaned['coverage']=(cleaned.observed&cleaned.target.notna()&~cleaned.quality_flags.str.startswith('derived')).astype(float)
         cleaned['weather_available']=cleaned[FEATURES if kind=='load' else LEGACY_SOLAR_FEATURES].notna().all(axis=1)
@@ -149,17 +156,8 @@ def build_dataset(settings, req, progress):
             context_metadata=load_context_metadata(raw,entities,settings,details,req.get('combine','splice'),limit);attach_load_context(cleaned,context_metadata)
             details['flat_runs']=context_metadata['quality_runs']
             details['valid_plateaus'].extend({**plateau,'source_entity':entity} for entity in entities for plateau in raw.attrs.get('sensors',{}).get(entity,{}).get('details',{}).get('valid_plateaus',[]))
-        extra={'filtered_outliers':sum(v['hours'] for k,v in details['excluded_by_reason'].items() if k in ('physical_limit','implausible_flat_load')),'filled_hours':int(cleaned.quality_flags.str.startswith('derived').sum()),'weather_source':'Open-Meteo historical weather','quality':details,'quality_policy':QUALITY_POLICY}
-        reasons={}
-        for reason,part in cleaned.groupby('quality_flags'):
-            if reason and reason not in ('spike_review','noise_normalized','reviewed_restore','valid_replacement_fallback'):reasons[reason]={'hours':len(part),'measured_energy_kwh':float(part.raw_target.sum()) if part.raw_target.notna().any() and np.isfinite(part.raw_target.dropna()).all() else None}
-        details['excluded_by_reason']=reasons;details['usable_hours']=int(cleaned.train_eligible.sum())
-        samples=[]
-        for reason in reasons:
-            for time in cleaned.index[cleaned.quality_flags==reason][:3]:
-                for at,row in cleaned.loc[time-pd.Timedelta(hours=1):time+pd.Timedelta(hours=1)].iterrows():
-                    samples.append({'time':at.isoformat(),'raw':None if not np.isfinite(row.raw_target) else float(row.raw_target),'cleaned':None if not np.isfinite(row.target) else float(row.target),'reason':row.quality_flags or 'valid'})
-        details['samples']=samples
+        details.update(exclusion_report(cleaned))
+        extra={'filtered_outliers':sum(v['hours'] for k,v in details['excluded_by_reason'].items() if k in ('physical_limit','implausible_flat_load','frozen_power_run','frozen_solar_run')),'filled_hours':int(cleaned.quality_flags.str.startswith('derived').sum()),'weather_source':'Open-Meteo historical weather','quality':details,'quality_policy':QUALITY_POLICY}
         if kind=='solar':
             for entity in entities:
                 for key in ('flat_runs','valid_plateaus'):details[key].extend({**r,'source_entity':entity} for r in raw.attrs.get('sensors',{}).get(entity,{}).get('details',{}).get(key,[]))
@@ -167,9 +165,12 @@ def build_dataset(settings, req, progress):
         if kind=='solar':extra.update(solar_pipeline=SOLAR_PIPELINE,irradiance_source='Open-Meteo global_tilted_irradiance',features=SOLAR_FEATURES)
         else:extra['calendar']=calendar.summary(expected)
     else:
-        cleaned=battery_quality(raw,settings) if kind=='battery' else raw.copy();extra={'filtered_outliers':0,'filled_hours':0}
+        cleaned=battery_quality(raw,settings,train_end);cleaned['history_available']=history_availability(raw);extra={'filtered_outliers':0,'filled_hours':0}
         removed=raw.notna()&cleaned.isna()
         extra['quality']={'policy':QUALITY_POLICY,'expected_hours':len(raw),'raw_hours':int(raw.notna().all(axis=1).sum()),'usable_hours':int(cleaned.notna().all(axis=1).sum()),'excluded_by_reason':{'sensor_fault':{'hours':int(removed.any(axis=1).sum()),'measured_energy_kwh':None}},'flat_runs':[],'valid_plateaus':[],'background_days':[],'background_references':[],'background_status':'Background exclusion applies only to consumption','samples':[],'evidence_limit':'Battery power and SoC are never interpolated; full/idle plateaus retained'}
+    available=cleaned.history_available
+    first_recorded=available.index[available][0] if available.any() else None
+    extra['availability']={'first_recorded_at':first_recorded.isoformat() if first_recorded is not None else None,'excluded_leading_hours':float(((cleaned.index>=start)&~available).sum())*(5/60 if kind=='battery' else 1),'requested_start':start.isoformat()}
     train=cleaned[training_mask(cleaned.index,start,train_end,'5min' if kind=='battery' else '1h')]
     valid=cleaned[(cleaned.index+pd.Timedelta(minutes=5 if kind=='battery' else 60)>val_start)&(cleaned.index<end)]
     if 'train_eligible' in cleaned:
@@ -206,17 +207,18 @@ def build_dataset(settings, req, progress):
         manifest.update(complete_windows=counts,usable_issue_origins=[c['origin'].isoformat() for c in cases],discarded_windows=skipped)
         sufficient=sufficient and any(c['valid_window'](c['daily_end']) is not None for c in cases)
         extra['split_manifest']=manifest
-    preview=cleaned.loc[cleaned.index>=start];series=preview['target'] if 'target' in preview else preview.iloc[:,0]
-    summary={'id':dataset_id,'preparation_version':2,'kind':kind,'bank_id':req.get('bank_id'),'request':req,'created_at':pd.Timestamp.now(tz='UTC').isoformat(),'rows':len(cleaned),'training_rows':len(train),'validation_rows':len(valid),'coverage_pct':round(100*(len(train)+len(valid))/max(1,len(expected[expected>=start])),1),'sufficient':sufficient,'readiness':'Ready to calibrate' if sufficient else ('LightGBM needs 7 measured training days, 4 validation days and a complete 72-hour window with prior context' if kind=='load' else 'Need measured solar training targets, a complete measured daylight validation day and archived weather' if kind=='solar' else f'Need at least {minimum} training rows and 24 validation rows'),'recommendation':'Use one or several comparable years for seasonal learning and 28–56 final validation days; shorter periods are experiments.','sources':entities,**extra,**dataset_preview(series)}
+    preview=cleaned.loc[(cleaned.index>=start)&available];series=preview['target'] if 'target' in preview else preview.iloc[:,0]
+    summary={'solar_configuration':solar_configuration(settings,bank.id) if bank else None,'id':dataset_id,'preparation_version':2,'kind':kind,'bank_id':req.get('bank_id'),'request':req,'created_at':pd.Timestamp.now(tz='UTC').isoformat(),'rows':len(cleaned),'training_rows':len(train),'validation_rows':len(valid),'coverage_pct':round(100*(len(train)+len(valid))/max(1,len(expected[expected>=start])),1),'sufficient':sufficient,'readiness':'Ready to calibrate' if sufficient else ('LightGBM needs 7 measured training days, 4 validation days and a complete 72-hour window with prior context' if kind=='load' else 'Need measured solar training targets, a complete measured daylight validation day and archived weather' if kind=='solar' else f'Need at least {minimum} training rows and 24 validation rows'),'recommendation':'Use one or several comparable years for seasonal learning and 28–56 final validation days; shorter periods are experiments.','sources':entities,**extra,**dataset_preview(series)}
     pd.to_pickle({'frame':cleaned,'start':start,'train_end':train_end,'val_start':val_start,'end':end,'entities':entities,'split_manifest':manifest,'source_metadata':raw.attrs}, DATA/(dataset_id+'.pkl'))
     write_json('dataset-'+dataset_id,summary)
     progress(f'Dataset built: {len(train)} training rows, {len(valid)} validation rows')
     return summary
 
-def list_datasets():
+def list_datasets(settings=None):
     summaries=[]
     for path in sorted(DATA.glob('dataset-*.json')):
         summary=json.loads(path.read_text())
+        if summary.get('kind')=='inverter':continue
         frame_path=DATA/(summary['id']+'.pkl')
         if summary.get('preview_version')!=PREVIEW_VERSION and frame_path.exists():
             saved=pd.read_pickle(frame_path)
@@ -224,9 +226,14 @@ def list_datasets():
             # Older datasets may include preceding context for consumption.
             start=saved.get('start')
             if start is not None: frame=frame.loc[frame.index>=start]
+            if 'history_available' in frame:frame=frame.loc[frame.history_available]
             series=frame['target'] if 'target' in frame else frame.iloc[:,0]
             summary.update(dataset_preview(series))
             write_json(path.stem,summary)
+        if settings is not None and summary.get('kind')=='solar':
+            try:matches=summary.get('solar_configuration')==solar_configuration(settings,summary.get('bank_id'))
+            except ValueError:matches=False
+            if not matches:summary={**summary,'sufficient':False,'readiness':'Solar settings have changed or this dataset predates configuration checks. Prepare data again.'}
         summaries.append(summary)
     return summaries
 
@@ -234,7 +241,7 @@ def list_datasets():
 def derive_solar(quality,settings,start,train_end,fill,limit):
     q=quality.copy();dark=pd.Series(dark_hours(settings,q.index),index=q.index)
     ordinary=q.raw_target.isna()&q.original_reason.isin(['','missing'])
-    night=q.raw_target.isna()&dark&q.original_reason.isin(['','missing','raw_history_unavailable'])
+    night=q.raw_target.isna()&dark&q.history_available&q.original_reason.isin(['','missing','raw_history_unavailable'])
     q.loc[night,'target']=0.;q.loc[night,'quality_flags']='derived_dark_zero';q.loc[night,'derived_method']='dark_zero'
     q.loc[night,'train_eligible']=True;q.loc[night,'validation_eligible']=False
     # Only one isolated original gap; endpoints must both be measured and same-source.

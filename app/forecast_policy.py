@@ -46,21 +46,32 @@ def diagnostics(actual,predicted,point=None):
     result['mean_pinball']=float(np.mean([result[k]['pinball'] for k in q]))
     return result
 
-def fit_calibration(records,grouped=False):
-    """Earlier chronological OOF residuals only; sparse groups shrink to pooled."""
+def fit_calibration(records,grouped=False,solar=False):
+    """Earlier held-out residuals; solar counts independent daylight targets."""
     rows=[r for r in records if r.get('scored',True)]
-    if len(rows)<180 or len({r['origin'][:10] for r in rows})<3:return {}
+    def distinct(selected):
+        # Latest issue per target prevents overlapping horizons inflating confidence.
+        chosen={}
+        for r in selected:
+            if r['time'] not in chosen or r['origin']>chosen[r['time']]['origin']:chosen[r['time']]=r
+        return list(chosen.values())
+    pooled_rows=distinct(rows) if solar else rows
+    minimum=24 if solar else 180
+    days={pd.Timestamp(r['time']).date() for r in pooled_rows} if solar else {r['origin'][:10] for r in pooled_rows}
+    if len(pooled_rows)<minimum or len(days)<3:return {}
     def offsets(selected):
-        n=len(selected);shrink=n/(n+100)
+        n=len(selected);shrink=n/(n+(24 if solar else 100))
         return {k:float(np.quantile([r['actual']-r[k] for r in selected],a)*shrink) for k,a in zip(('low','middle','high'),(.1,.5,.9))}
-    pooled=offsets(rows);result={'pooled':pooled}
+    pooled=offsets(pooled_rows);result={'pooled':pooled}
     if grouped:
         for g in range(3):
             part=[r for r in rows if min(int(r['lead'])//24,2)==g]
-            if len(part)>=180:
-                local=offsets(part);w=len(part)/(len(part)+300)
+            if solar:part=distinct(part)
+            if len(part)>=(24 if solar else 180):
+                local=offsets(part);w=len(part)/(len(part)+(48 if solar else 300))
                 result[str(g)]={k:w*local[k]+(1-w)*pooled[k] for k in pooled}
     return result
+
 
 def recent_correction(records,origin,leads,policy,solar=False):
     """Settled previous issues only; one latest issue per target, bounded/shrunk."""

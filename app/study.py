@@ -5,7 +5,7 @@ Every fitting/stopping target finishes before the corresponding scored fold.
 """
 import hashlib,os,time
 import joblib,lightgbm as lgb,numpy as np,pandas as pd
-from .config import DATA,read_json,write_json
+from .config import DATA,read_json,write_json, solar_banks
 from .forecast_policy import (FEATURE_SCHEMA,INTERVAL_POLICY,archived_run,ordered,diagnostics,fit_calibration,
                              recent_correction,LEAD_GROUPS,SETTLEMENT_HOURS)
 from .datasets import FEATURES,SOLAR_FEATURES,LEGACY_SOLAR_FEATURES,features,bank_features
@@ -18,15 +18,16 @@ BASE=dict(num_leaves=31,max_depth=5,min_child_samples=100,learning_rate=.05,reg_
 SHAPES=[dict(num_leaves=n,max_depth=d) for n,d in ((15,4),(63,6),(127,7),(31,7))]+[dict(min_child_samples=n) for n in (30,300)]+[dict(learning_rate=r) for r in (.02,.1)]+[dict(reg_lambda=5.,reg_alpha=.5,subsample=.8,colsample_bytree=.8)]
 CORRECTIONS=[None,{'days':3,'bound':.25,'taper':24},{'days':7,'bound':.5,'taper':48}]
 
-def usable_columns(kind):
-    return FEATURES if kind=='load' else LEGACY_SOLAR_FEATURES
+def usable_columns(kind,frame=None):
+    extra=[c for c in frame.columns if c.startswith('bank_irradiance_')] if frame is not None else []
+    return FEATURES if kind=='load' else LEGACY_SOLAR_FEATURES+extra
 
-def schema(kind):
+def schema(kind,frame=None):
     from .load_training import LOAD_FEATURES
-    return LOAD_FEATURES if kind=='load' else SOLAR_FEATURES
+    return LOAD_FEATURES if kind=='load' else SOLAR_FEATURES+([c for c in frame.columns if c.startswith('bank_irradiance_')] if frame is not None else [])
 
 def _finite(x,kind):
-    return x[usable_columns(kind)].notna().all(axis=1)
+    return x[usable_columns(kind,x)].notna().all(axis=1)
 
 def origins(start,end,settings):
     """Exact local clocks, including half-hour zones and DST boundaries."""
@@ -64,7 +65,7 @@ def make_case(frame,origin,end,settings,kind,bank=None,basis='issued',calendar=N
         x['weather_run_age']=(pd.Timestamp(origin)-pd.Timestamp(run)).total_seconds()/3600 if run else np.nan
         dark=np.zeros(len(x),bool)
     else:
-        x=bank_features(weather,bank,settings,origin) if basis=='issued' else frame.reindex(index)[SOLAR_FEATURES].copy()
+        x=bank_features(weather,bank,settings,origin) if basis=='issued' else frame.reindex(index)[schema(kind,frame)].copy()
         x['lead_hours']=np.asarray((index-pd.Timestamp(origin)).total_seconds()/3600)
         dark=dark_hours(settings,index);x['full_dark']=dark.astype(float)
     actual=frame.target.reindex(index).to_numpy(float)
@@ -133,14 +134,14 @@ def fitting_rows(frame,start,end,settings,kind,bank=None,basis='issued',progress
             x=c['x'].copy()
             if basis in ('historical','historical_full'):
                 historic=frame.reindex(index)
-                x[usable_columns(kind)]=historic[usable_columns(kind)].to_numpy()
+                x[usable_columns(kind,frame)]=historic[usable_columns(kind,frame)].to_numpy()
                 x['weather_run_age']=np.nan
             eligible &= _finite(x,kind).to_numpy()
             chunks.append(x.loc[eligible]);ys.append(target.target.to_numpy(float)[eligible]);times.extend(index[eligible]);methods.extend(target.get('derived_method',pd.Series('',index=index)).fillna('').to_numpy()[eligible])
         except Exception as exc:failed.append({'origin':str(origin),'reason':str(exc)})
         if i%40==0:progress(f'{kind}: preparing {basis} fitting origins {i+1}/{len(available)}')
     if not chunks:raise ValueError(f'No archive-supported fitting origins for {kind}')
-    x=pd.concat(chunks,ignore_index=True)[schema(kind)].astype(np.float32);y=np.concatenate(ys);times=pd.DatetimeIndex(times)
+    x=pd.concat(chunks,ignore_index=True)[schema(kind,frame)].astype(np.float32);y=np.concatenate(ys);times=pd.DatetimeIndex(times)
     # Stitched operational forecasts do not disclose one initialization. Train that missing-age case.
     x.loc[np.arange(len(x))%7==0,'weather_run_age']=np.nan
     x.attrs['preparation']={'origin_limit':limit,'origins':len(chunks),'rows':len(x),'unique_target_hours':len(times.unique()),'unavailable':failed,'weather_basis':basis,'start':str(start),'end':str(end)}
@@ -163,7 +164,7 @@ def fit(frame,data,cutoff,config,kind,heads=('middle',),progress=lambda s:None):
     x,y,times,methods=row_filter(frame,*data,config,kind)
     issued_x=x.copy()
     if config.get('weather_basis')=='historical':
-        x=x.copy();x[usable_columns(kind)]=frame.reindex(times)[usable_columns(kind)].to_numpy();x['weather_run_age']=np.nan
+        x=x.copy();x[usable_columns(kind,frame)]=frame.reindex(times)[usable_columns(kind,frame)].to_numpy();x['weather_run_age']=np.nan
     unique=times.unique().sort_values();split=unique[int(len(unique)*.8)]
     early=times+pd.Timedelta(hours=1)<=split;late=times>=split
     # Stopping truth: measured daylight, never interpolation/dark-derived targets.
@@ -171,19 +172,25 @@ def fit(frame,data,cutoff,config,kind,heads=('middle',),progress=lambda s:None):
     if early.sum()<100 or late.sum()<24:raise ValueError('Insufficient chronological stopping data')
     weight=np.ones(len(y));half=config.get('half_life_days')
     if half:weight*=2**(-np.asarray((cutoff-times).total_seconds())/86400/half)
+    if kind=='solar':
+        counts=pd.Series(times).value_counts();weight/=np.array([counts[t] for t in times]);weight/=weight.mean()
     weight[methods=='interpolation']*=.25
     params={**BASE,**{k:v for k,v in config.items() if k in BASE},'subsample_freq':1,'random_state':42,'n_jobs':int(os.getenv('ENERGY_TRAIN_THREADS','2')),'verbosity':-1,'deterministic':True,'force_col_wise':True}
     models={};iterations={};curves={}
     ceiling=int(os.getenv('ENERGY_TRAIN_TREES','1000'))
     for key in heads:
+        if kind=='solar' and key=='mean' and config.get('point_family') in ('physical','residual'):
+            from .solar_estimators import SolarEnergyModel
+            model=SolarEnergyModel(config['point_family']).fit(x,y,weight);models[key]=model;iterations[key]=model.iterations_;curves[key]={'basis':'Shared physical scale; bounded residual fit' if config['point_family']=='residual' else 'Shared learned irradiance scale'}
+            progress(f'Solar {config["point_family"]}: {len(times.unique()):,} distinct target hours');continue
         alpha={'low':.1,'middle':.5,'high':.9}.get(key)
         objective='regression' if key=='mean' else 'quantile';metric='l2' if key=='mean' else 'quantile'
         cfg={**params,'objective':objective,'metric':metric,'n_estimators':ceiling}
         if alpha is not None:cfg['alpha']=alpha
-        probe=lgb.LGBMRegressor(**cfg);probe.fit(x.loc[early],y[early],sample_weight=weight[early],eval_set=[(issued_x.loc[late],y[late])],callbacks=[lgb.early_stopping(60,verbose=False)])
+        probe=lgb.LGBMRegressor(**cfg);probe.fit(x.loc[early],y[early],sample_weight=weight[early],eval_set=[(issued_x.loc[late],y[late])],eval_sample_weight=[weight[late]] if kind=='solar' else None,callbacks=[lgb.early_stopping(60,verbose=False)])
         if (probe.best_iteration_ or ceiling)>=ceiling*.95:
             cfg['n_estimators']=min(3000,ceiling*3)
-            probe=lgb.LGBMRegressor(**cfg);probe.fit(x.loc[early],y[early],sample_weight=weight[early],eval_set=[(issued_x.loc[late],y[late])],callbacks=[lgb.early_stopping(100,verbose=False)])
+            probe=lgb.LGBMRegressor(**cfg);probe.fit(x.loc[early],y[early],sample_weight=weight[early],eval_set=[(issued_x.loc[late],y[late])],eval_sample_weight=[weight[late]] if kind=='solar' else None,callbacks=[lgb.early_stopping(100,verbose=False)])
         stop=probe.best_iteration_ or cfg['n_estimators'];curves[key]={'ceiling':cfg['n_estimators'],'best_iteration':stop,'near_ceiling':stop>=cfg['n_estimators']*.95,'stopping_rows':int(late.sum()),'fitting_rows':int(early.sum()),'sampled_loss':probe.evals_result_['valid_0'][metric][::50]}
         model=lgb.LGBMRegressor(**{**cfg,'n_estimators':stop});model.fit(x,y,sample_weight=weight);models[key]=model;iterations[key]=stop
         progress(f'{kind} {key}: {len(x):,} rows; {stop} trees')
@@ -207,6 +214,16 @@ def predict(models,c,kind,point_method=None,calibration=None,cutoff=0,correction
     q['point']=point
     return q
 
+def assessment_chart(records,limit=480):
+    # Pick the latest issue for each target (shortest lead), then sample the full span.
+    chosen={}
+    for r in records:
+        if r['time'] not in chosen or r['origin']>chosen[r['time']]['origin']:chosen[r['time']]=r
+    rows=sorted(chosen.values(),key=lambda r:r['time'])
+    indices=np.unique(np.linspace(0,len(rows)-1,min(limit,len(rows)),dtype=int)) if rows else []
+    return [{'time':rows[i]['time'],'actual':rows[i]['actual'],'predicted':rows[i]['point']} for i in indices]
+
+
 def summarize(cases,predictions,settings,kind):
     rows=[];energy={str(h):[] for h in (24,48,72)};energy['daily']=[];energy['overnight']=[];hourly=[];ys=[];qs={k:[] for k in ('low','middle','high')};points=[];records=[]
     for c,q in zip(cases,predictions):
@@ -224,7 +241,7 @@ def summarize(cases,predictions,settings,kind):
     quiet_days={pd.Timestamp(r['time']).tz_convert(settings.timezone).date() for r in records if r['quiet']}
     for r in records:r['return_day']=not r['quiet'] and (pd.Timestamp(r['time']).tz_convert(settings.timezone).date()-pd.Timedelta(days=1)) in quiet_days
     def em(items):
-        e=np.array([r['error_kwh'] for r in items]);return {'samples':len(e),'windows':len(e),'energy_mae_kwh':float(np.mean(abs(e))),'energy_bias_kwh':float(e.mean()),'distinct_issue_days':len({r['origin'][:10] for r in items})} if len(e) else {'samples':0,'windows':0}
+        e=np.array([r['error_kwh'] for r in items]);return {'samples':len(e),'windows':len(e),'energy_mae_kwh':float(np.mean(abs(e))),'energy_bias_kwh':float(e.mean()),'distinct_issue_days':len({r['origin'][:10] for r in items}),'energy_bias_pct':float(100*e.sum()/sum(r['actual_kwh'] for r in items)) if sum(r['actual_kwh'] for r in items)>0 else None} if len(e) else {'samples':0,'windows':0}
     selected=[r for r in records if r['scored']];actual=np.array([r['actual'] for r in records]);point=np.array([r['point'] for r in records])
     if not selected:raise ValueError('No measured scoring targets')
     diag=lambda rr:diagnostics([r['actual'] for r in rr],{k:[r[k] for r in rr] for k in ('low','middle','high')},[r['point'] for r in rr])
@@ -240,8 +257,12 @@ def summarize(cases,predictions,settings,kind):
         'bias_direction':'predicted minus actual; positive means overprediction','metric_schema':'energy-diagnostics-v3',
         'note':'Retrospective development/diagnostic evidence. Overlapping horizons are not independent; prospective assessment pending.'}
     if kind=='solar':
-        day=[r for r in records if r['scored']];summary['daytime']={'mae':float(np.mean([abs(r['point']-r['actual']) for r in day])),'bias_kw':float(np.mean([r['point']-r['actual'] for r in day])),'samples':len(day)}
-        summary['all_hours']=hourly
+        from .solar_training import power_metrics
+        day=[r for r in records if r['scored']];day_metrics=power_metrics([r['actual'] for r in day],[r['point'] for r in day],np.ones(len(day)))
+        summary['daytime']=day_metrics;summary['all_hours']=hourly
+        summary['hourly']={**day_metrics,'bias':day_metrics['bias_kw'],'basis':'Measured daylight forecast/target pairs; repeated targets across issues'}
+        summary['unique_daylight_hours']=len({r['time'] for r in day})
+        summary['chart_basis']='Latest available issue per target; shortest lead; evenly sampled across the full validation period'
     return summary,energy,records
 
 def normalized(summary,reference,kind):
@@ -274,12 +295,24 @@ def run(settings,summary,d,progress):
     from .models import signature
     from .load_training import selection_folds,fold_frame,LoadPredictor
     from .uncertainty import fit_dependence
-    started=time.perf_counter();kind=summary['kind'];name=summary['id'];frame=d['frame'];start=d['start'];end=d['train_end'];bank=next((b for b in settings.banks if b.id==summary.get('bank_id')),None)
+    started=time.perf_counter();kind=summary['kind'];name=summary['id'];frame=d['frame'];start=d['start'];end=d['train_end'];bank=next((b for b in solar_banks(settings) if b.id==summary.get('bank_id')),None)
     if kind=='solar':
+        if bank.history_start:
+            start=max(start,pd.Timestamp(bank.history_start,tz=settings.timezone).tz_convert('UTC'))
+            if start>=end:raise ValueError('Training dates precede the current panel layout. Choose dates after the production-history start.')
         frame=frame.copy()
+        if bank.id=='__combined' and not any(c.startswith('bank_irradiance_') for c in frame.columns):
+            from .sources import solar_weather
+            progress('Updating separate bank sunlight inputs for the prepared history')
+            weather=solar_weather(settings,bank,start,d['end'],historical=True)
+            for c in weather.columns:
+                if c.startswith('bank_irradiance_'):frame[c]=weather[c].reindex(frame.index)
         # Rebuild shared geometry/darkness features; newly added issue fields stay unknown here.
         frame['full_dark']=dark_hours(settings,frame.index).astype(float);frame['lead_hours']=np.nan;frame['weather_run_age']=np.nan
     folds=selection_folds(frame,start,end,settings)
+    if kind=='solar' and len(folds)==1:
+        boundary=folds[0]['start'];left=max(start+pd.Timedelta(days=7),boundary-pd.Timedelta(days=4)).ceil('h')
+        if boundary-left>=pd.Timedelta(days=3):folds.insert(0,{'start':left,'end':boundary,'season':folds[0]['season'],'reason':'Earlier disjoint solar block for uncertainty calibration; expanding prefix'})
     # Include a latest regime-specific expanding fold when hardware changed recently.
     recent=end-pd.Timedelta(days=7)
     if recent>start+pd.Timedelta(days=14) and all(f['end']<=recent for f in folds):folds.append({'start':recent.ceil('h'),'end':end,'season':'recent','reason':'Recent hardware/regime fold; earlier prefix only; short-history evidence'})
@@ -307,7 +340,7 @@ def run(settings,summary,d,progress):
     manifest['issued_folds']=[{'fold':{k:str(v) for k,v in joblib.load(p)['fold'].items()},'origins':[c['origin'].isoformat() for c in joblib.load(p)['cases']],'preparation':joblib.load(p)['data'][0].attrs.get('preparation',{}),'skipped':joblib.load(p)['skipped']} for p,_ in prepared]
     write_json(name+'-comparison-manifest',manifest)
     comparisons=[];cache={}
-    def compare(config,heads=('middle','mean') if kind=='load' else ('middle',)):
+    def compare(config,heads=('middle','mean')):
         fold_results=[];all_records=[]
         for path,scoped in prepared:
             entry=joblib.load(path);f=entry['fold'];cc=entry['cases'];key=(str(path),str(sorted(config.items())),heads)
@@ -322,7 +355,7 @@ def run(settings,summary,d,progress):
                 ref=[predict(cache[refkey],c,kind) for c in cc]
             refsummary,_,_=summarize(cc,ref,settings,kind)
             choices=[]
-            methods=[{'head':h,'baseline_weight':w} for h in ('middle','mean') for w in (0,.5,1)] if kind=='load' else [{'head':'middle','baseline_weight':0}]
+            methods=[{'head':h,'baseline_weight':w} for h in ('middle','mean') for w in (0,.5,1)] if kind=='load' else [{'head':h,'baseline_weight':0} for h in ('middle','mean')]
             for method in methods:
                 result,energy,records=_score(models,cc,settings,kind,point_method=method)
                 choices.append({'method':method,**normalized(result,refsummary,kind),'summary':result})
@@ -346,7 +379,10 @@ def run(settings,summary,d,progress):
     if kind=='load':
         for half in (365,180,90,30):compare({**weather_base,'half_life_days':half})
     chosen=min(comparisons,key=lambda r:r['score']);base=chosen['configuration']
-    for shape in SHAPES:compare({**base,**shape})
+    shapes=SHAPES if kind=='load' or end-start>=pd.Timedelta(days=90) else [dict(num_leaves=7,max_depth=3,min_child_samples=30),dict(num_leaves=15,max_depth=4,min_child_samples=50)]
+    for shape in shapes:compare({**base,**shape})
+    if kind=='solar':
+        for family in ('physical','residual'):compare({**base,'point_family':family})
     # Recipes are tested at a fixed chosen capacity/decay.
     selected=min(comparisons,key=lambda r:r['score']);base=selected['configuration']
     for recipe in (('dark_zero','weighted_interpolation') if kind=='solar' else ('exclude_quiet','recent_only')):
@@ -354,7 +390,7 @@ def run(settings,summary,d,progress):
         except ValueError as exc:comparisons.append({'configuration':{**base,recipe:True},'unavailable':str(exc)})
     supported=[r for r in comparisons if 'score' in r];finalists=sorted(supported,key=lambda r:r['score'])[:2]
     # Fit all heads for finalists; include tail evidence in final selection.
-    finalists=[compare(r['configuration'],('low','middle','high','mean') if kind=='load' else ('low','middle','high')) for r in finalists]
+    finalists=[compare(r['configuration'],('low','middle','high','mean')) for r in finalists]
     best_energy=min(r['score'] for r in finalists);viable=[r for r in finalists if r['score']<=best_energy*1.02]
     selected=min(viable,key=lambda r:(float(np.mean([f['summary']['quantile']['mean_pinball'] for f in r['folds']])),r['configuration']['num_leaves']))
     config=selected['configuration'];all_choices={}
@@ -365,11 +401,11 @@ def run(settings,summary,d,progress):
     earlier=[];post_scores=[];calibration_options=('identity','pooled','lead_group')
     variants=[(cut,cor,cal) for cut in ((0,5) if kind=='solar' else (0,)) for cor in CORRECTIONS for cal in calibration_options]
     for path,scoped in prepared:
-        entry=joblib.load(path);cc=entry['cases'];f=entry['fold'];heads=('low','middle','high','mean') if kind=='load' else ('low','middle','high');models=cache[(str(path),str(sorted(config.items())),heads)][0]
+        entry=joblib.load(path);cc=entry['cases'];f=entry['fold'];heads=('low','middle','high','mean');models=cache[(str(path),str(sorted(config.items())),heads)][0]
         _,_,raw_records=_score(models,cc,settings,kind,point_method=point_method)
         if earlier:
             for cut,cor,cal in variants:
-                offsets={} if cal=='identity' else fit_calibration(earlier,cal=='lead_group')
+                offsets={} if cal=='identity' else fit_calibration(earlier,cal=='lead_group',solar=kind=='solar')
                 # Sequential replay gives corrections only already settled OOF outcomes.
                 history=[];pp=[]
                 for c in cc:
@@ -377,38 +413,40 @@ def run(settings,summary,d,progress):
                     _,_,fresh=summarize([c],[predict(models,c,kind,point_method)],settings,kind);history.extend(fresh)
                 result,_,_=summarize(cc,pp,settings,kind)
                 ref=next(v['reference'] for v in selected['folds'] if v['fold']['start']==str(f['start']))
-                post_scores.append({'cutoff':cut,'correction':cor,'calibration':cal,'fold_start':str(f['start']),**normalized(result,ref,kind),'pinball':result['quantile']['mean_pinball'],'width':result['quantile']['width_kw'],'lower_tail':result['quantile']['lower_tail'],'upper_tail':result['quantile']['upper_tail']})
+                post_scores.append({'cutoff':cut,'correction':cor,'calibration':cal,'fold_start':str(f['start']),**normalized(result,ref,kind),'pinball':result['quantile']['mean_pinball'],'width':result['quantile']['width_kw'],'lower_tail':result['quantile']['lower_tail'],'upper_tail':result['quantile']['upper_tail'],'tail_error':abs(result['quantile']['lower_tail']-.1)+abs(result['quantile']['upper_tail']-.1)})
         earlier.extend(raw_records)
     post=[]
     for cut,cor,cal in variants:
         part=[r for r in post_scores if r['cutoff']==cut and r['correction']==cor and r['calibration']==cal]
-        if part:post.append({'cutoff':cut,'correction':cor,'calibration':cal,'score':float(np.mean([r['score'] for r in part])),'pinball':float(np.mean([r['pinball'] for r in part])),'width':float(np.mean([r['width'] for r in part]))})
-    policy=min(post,key=lambda r:(round(r['score']/.005),r['pinball'],r['correction'] is not None,r['calibration']!='identity')) if post else {'cutoff':0,'correction':None,'calibration':'identity'}
-    calibration={} if policy['calibration']=='identity' else fit_calibration(earlier,policy['calibration']=='lead_group')
+        if part:post.append({'cutoff':cut,'correction':cor,'calibration':cal,'score':float(np.mean([r['score'] for r in part])),'pinball':float(np.mean([r['pinball'] for r in part])),'width':float(np.mean([r['width'] for r in part])),'tail_error':float(np.mean([r['tail_error'] for r in part]))})
+    policy=min(post,key=lambda r:(round(r['score']/.005),round(r.get('tail_error',0)/.02) if kind=='solar' else 0,r['pinball'],r['correction'] is not None,r['calibration']!='identity')) if post else {'cutoff':0,'correction':None,'calibration':'identity'}
+    if kind=='solar' and not post and fit_calibration(earlier,solar=True):
+        policy={**policy,'calibration':'pooled'}
+    calibration={} if policy['calibration']=='identity' else fit_calibration(earlier,policy['calibration']=='lead_group',solar=kind=='solar')
     # Weather basis is selected on identical issued-origin/target pairs. Older
     # history is a separate recent-fold diagnostic, with its limits recorded.
     last_path,last_scoped=prepared[-1];entry=joblib.load(last_path)
     alternative_basis='historical' if config.get('weather_basis')=='issued' else 'issued'
-    alternative,_,_=fit(last_scoped,entry['data'],entry['fold']['start'],{**config,'weather_basis':alternative_basis},kind,('middle','mean') if kind=='load' else ('middle',),progress)
+    alternative,_,_=fit(last_scoped,entry['data'],entry['fold']['start'],{**config,'weather_basis':alternative_basis},kind,('middle','mean'),progress)
     weather_ablation={'alternative_basis':alternative_basis,'summary':_score(alternative,entry['cases'],settings,kind,point_method=point_method)[0],
                       'common_period_initial_scores':{'issued':initial['score'],'historical':historical_initial['score']}}
     older_history={}
     try:
         old_data=fitting_rows(last_scoped,start,entry['fold']['start'],settings,kind,bank,basis='historical_full',progress=progress)
-        old_models,_,_=fit(last_scoped,old_data,entry['fold']['start'],{**config,'weather_basis':'historical'},kind,('middle','mean') if kind=='load' else ('middle',),progress)
+        old_models,_,_=fit(last_scoped,old_data,entry['fold']['start'],{**config,'weather_basis':'historical'},kind,('middle','mean'),progress)
         older_history={'summary':_score(old_models,entry['cases'],settings,kind,point_method=point_method)[0],
                        'preparation':old_data[0].attrs.get('preparation',{}),'status':'Separate older-history recent-fold diagnostic; not promoted from one-fold evidence'}
     except ValueError as exc:older_history={'unavailable':str(exc)}
     progress(f'{name}: fitting frozen final recipe')
     final_data=fitting_rows(frame,start,end,settings,kind,bank,progress=progress)
-    models,iterations,curves=fit(frame,final_data,end,config,kind,('low','middle','high','mean') if kind=='load' else ('low','middle','high'),progress)
+    models,iterations,curves=fit(frame,final_data,end,config,kind,('low','middle','high','mean'),progress)
     dependence_records=[]
     for origin in sorted({r['origin'] for r in earlier}):
         rr=sorted([r for r in earlier if r['origin']==origin],key=lambda r:r['time'])
         q=ordered({k:[r[k] for r in rr] for k in ('low','middle','high')},[r['lead'] for r in rr],calibration)
         dependence_records.extend({**r,**{k:float(q[k][j]) for k in q}} for j,r in enumerate(rr))
     dependence=fit_dependence(dependence_records,solar=kind=='solar')
-    artifact={'schema':FEATURE_SCHEMA,'pipeline':LOAD_PIPELINE,'quality_policy':QUALITY_POLICY,'models':{k:v for k,v in models.items() if k!='mean'},'mean_model':models.get('mean'),'timezone':settings.timezone,'features':schema(kind),'point_method':point_method,'calibration':calibration,'correction':policy['correction'],'irradiance_cutoff':policy['cutoff'],'sampling_rho':dependence['rho'],'sampling_dependence':dependence}
+    artifact={'schema':FEATURE_SCHEMA,'pipeline':LOAD_PIPELINE,'quality_policy':QUALITY_POLICY,'models':{k:v for k,v in models.items() if k!='mean'},'mean_model':models.get('mean'),'timezone':settings.timezone,'features':schema(kind,frame),'point_method':point_method,'calibration':calibration,'correction':policy['correction'],'irradiance_cutoff':policy['cutoff'],'sampling_rho':dependence['rho'],'sampling_dependence':dependence}
     # This assessment is inspected once, after recipe/postprocessing are frozen.
     final_cases,skipped=cases(frame,d['val_start'],d['end'],settings,kind,bank,progress=progress)
     pp=[];history=[]
@@ -417,9 +455,15 @@ def run(settings,summary,d,progress):
         _,_,fresh=_score(models,[c],settings,kind,point_method=point_method);history.extend(fresh)
     result,energy,records=summarize(final_cases,pp,settings,kind)
     legacy_path=DATA/(name+'.joblib');comparison=None;old_energy=None
+    comparison_result=result
+    comparison_note=''
     if legacy_path.exists():
         old=joblib.load(legacy_path);old_predictions=[]
-        for c in final_cases:
+        old_meta=read_json('model-'+name,{})
+        old_cutoff=old_meta.get('training_end')
+        paired=[(c,q) for c,q in zip(final_cases,pp) if kind!='solar' or old_cutoff and c['origin']>=pd.Timestamp(old_cutoff)]
+        if not paired:comparison_note='No paired comparison: the active model has no known earlier fitting cutoff for these validation issues.'
+        for c,_ in paired:
             if kind=='load':
                 from .load_training import legacy_feature_rows
                 old_x=legacy_feature_rows(frame,c,settings) if old.get('pipeline')=='lightgbm-quantile-direct-v2' else c['x']
@@ -428,18 +472,25 @@ def run(settings,summary,d,progress):
                 from .solar_training import solar_predict
                 pred=solar_predict(old,c['x']);pred['point']=pred.get('point',pred['middle'])
             old_predictions.append(pred)
-        old_summary,old_energy,old_records=summarize(final_cases,old_predictions,settings,kind)
-        comparison={'metrics':old_summary['hourly'],'chart':[{'time':r['time'],'actual':r['actual'],'predicted':r['point']} for r in old_records[:73]],('load_validation' if kind=='load' else 'forecast_validation'):old_summary,'comparison_basis':'Identical issues after fitting cutoffs; known retrospective benchmark'}
+        if paired:
+            paired_cases=[c for c,_ in paired]
+            old_summary,old_energy,old_records=summarize(paired_cases,old_predictions,settings,kind)
+            comparison_result,_,_=summarize(paired_cases,[q for _,q in paired],settings,kind)
+            comparison={'metrics':old_summary['hourly'],'chart':assessment_chart(old_records),('load_validation' if kind=='load' else 'forecast_validation'):old_summary,'candidate_metrics':comparison_result['hourly'],'candidate_validation':comparison_result,'comparison_basis':'Identical issues after both models’ fitting cutoffs; known retrospective benchmark','issue_start':paired_cases[0]['origin'].isoformat()}
     baseline=None
     if kind=='load':
         baseline=summarize(final_cases,[{'low':c['x'].clock_profile.to_numpy(),'middle':c['x'].clock_profile.to_numpy(),'high':c['x'].clock_profile.to_numpy(),'point':c['x'].clock_profile.to_numpy()} for c in final_cases],settings,kind)[0]
     diagnostic=result['quantile'];diagnostic.update(pinball_low=diagnostic['low']['pinball'],pinball_mid=diagnostic['middle']['pinball'],pinball_high=diagnostic['high']['pinball'],width=diagnostic['width_kw'],coverage_daylight=diagnostic['coverage'],width_daylight_kw=diagnostic['width_kw'])
     # Existing UI/clients receive versioned metrics with an explicit bias direction.
     result['weather_model']=settings.weather_model;result['publication_buffer_hours']=12;result['runs']=[];result['skipped']=skipped;result['daily_chart']=energy['daily']
-    chart=[{'time':r['time'],'actual':r['actual'],'predicted':r['point']} for r in records[:73]]
-    metadata={'trained_at':pd.Timestamp.now(tz='UTC').isoformat(),'dataset_id':name,'kind':kind,'bank_id':summary.get('bank_id'),'model':'Issued-weather LightGBM energy / quantiles','pipeline':LOAD_PIPELINE,'solar_pipeline':__import__('app.datasets',fromlist=['SOLAR_PIPELINE']).SOLAR_PIPELINE if kind=='solar' else None,'schema':FEATURE_SCHEMA,'quality_policy':QUALITY_POLICY,'config_signature':signature(settings,kind,summary.get('bank_id')),'dataset_created_at':summary['created_at'],'training_rows':len(final_data[1]),'unique_target_hours':len(final_data[2].unique()),'validation_rows':result['hourly']['samples'],'metrics':result['hourly'],'chart':chart,('load_validation' if kind=='load' else 'forecast_validation'):result,'comparison':comparison,'history_baseline':baseline,'training_start':str(start),'training_end':str(end),'validation_start':str(d['val_start']),'validation_end':str(d['end']),'point_method':point_method,'calibration':calibration,'correction':policy['correction'],'irradiance_cutoff':policy['cutoff'],'sampling_rho':artifact['sampling_rho'],'sampling_dependence':dependence,'weather_basis':('Historical relationship on archive-supported target pairs; issued-weather selection' if config.get('weather_basis')=='historical' else 'Issued archived runs; 12h conservative availability; live stitched run age unknown'),'parameters':config,'iterations':iterations,'learning_curves':curves,'configuration_search':comparisons,'postprocessing_search':post,'postprocessing_folds':post_scores,'weather_ablation':weather_ablation,'older_history_ablation':older_history,'split_manifest':manifest,'selection_windows':manifest['folds'],'feature_importance':dict(zip(schema(kind),models['middle'].feature_importances_.tolist())),'timings_seconds':{'total':time.perf_counter()-started},'assessment_classification':'promising but insufficient evidence' if comparison and result['hourly']['mae']<comparison['metrics']['mae']*.98 else 'no material change' if not comparison or result['hourly']['mae']<=comparison['metrics']['mae']*1.02 else 'regression','paired_bootstrap':{h:paired_bootstrap(energy[h],old_energy[h]) for h in ('daily','overnight','24','48','72')} if old_energy else {},'fitting_preparation':final_data[0].attrs.get('preparation',{})}
+    chart=assessment_chart(records)
+    metadata={'trained_at':pd.Timestamp.now(tz='UTC').isoformat(),'dataset_id':name,'kind':kind,'bank_id':summary.get('bank_id'),'model':'Issued-weather LightGBM energy / quantiles','pipeline':LOAD_PIPELINE,'solar_pipeline':__import__('app.datasets',fromlist=['SOLAR_PIPELINE']).SOLAR_PIPELINE if kind=='solar' else None,'schema':FEATURE_SCHEMA,'quality_policy':QUALITY_POLICY,'config_signature':signature(settings,kind,summary.get('bank_id')),'dataset_created_at':summary['created_at'],'training_rows':len(final_data[1]),'unique_target_hours':len(final_data[2].unique()),'validation_rows':result['hourly']['samples'],'metrics':result['hourly'],'chart':chart,('load_validation' if kind=='load' else 'forecast_validation'):result,'comparison':comparison,'history_baseline':baseline,'training_start':str(start),'training_end':str(end),'validation_start':str(d['val_start']),'validation_end':str(d['end']),'point_method':point_method,'calibration':calibration,'correction':policy['correction'],'irradiance_cutoff':policy['cutoff'],'sampling_rho':artifact['sampling_rho'],'sampling_dependence':dependence,'weather_basis':('Historical relationship on archive-supported target pairs; issued-weather selection' if config.get('weather_basis')=='historical' else 'Issued archived runs; 12h conservative availability; live stitched run age unknown'),'parameters':config,'iterations':iterations,'learning_curves':curves,'configuration_search':comparisons,'postprocessing_search':post,'postprocessing_folds':post_scores,'weather_ablation':weather_ablation,'older_history_ablation':older_history,'split_manifest':manifest,'selection_windows':manifest['folds'],'feature_importance':dict(zip(schema(kind,frame),models['middle'].feature_importances_.tolist())),'timings_seconds':{'total':time.perf_counter()-started},'assessment_classification':'promising but insufficient evidence' if comparison and result['hourly']['mae']<comparison['metrics']['mae']*.98 else 'no material change' if not comparison or result['hourly']['mae']<=comparison['metrics']['mae']*1.02 else 'regression','paired_bootstrap':{h:paired_bootstrap(energy[h],old_energy[h]) for h in ('daily','overnight','24','48','72')} if old_energy else {},'fitting_preparation':final_data[0].attrs.get('preparation',{})}
+    metadata['comparison_note']=comparison_note
     if kind=='load':
         eligible=frame.loc[training_mask(frame.index,start,end)&frame.train_eligible];profile=eligible.target.groupby(eligible.index.tz_convert(settings.timezone).hour).mean();metadata['hour_profile']={str(k):float(v) for k,v in profile.items()}
+    if kind=='solar':
+        metadata['uncertainty_calibration']={'status':'residual-adjusted' if calibration else 'identity-selected' if post and fit_calibration(earlier,solar=True) else 'uncalibrated','basis':'Earlier chronological development predictions only; final assessment excluded','independently_selected':bool(post and fit_calibration(earlier,solar=True)),'development_folds':len(prepared),'unique_calibration_hours':len({r['time'] for r in earlier if r['scored']}),'note':'Short-history calibration is experimental; inspect final daylight coverage and P90 exceedances by lead.' if end-start<pd.Timedelta(days=90) else 'Inspect validation coverage; future coverage is not established.'}
+        metadata['history_warning']='Short training history: use more measured history from the same panel layout when available.' if end-start<pd.Timedelta(days=90) else ''
     metadata['target_counts']={m:int(np.sum(final_data[3]==m)) for m in ('','dark_zero','interpolation')}
     metadata['stopping_truth']='Measured targets only; measured daylight for solar; chronological target-interval purge'
     metadata['scoring_truth']='Measured daylight plus deterministic full-dark energy accounting; interpolation never scored'
@@ -447,10 +498,10 @@ def run(settings,summary,d,progress):
     metadata['coverage_goals']={'minimum_measured_pct':90,'minimum_72h_issue_days':10,'minimum_local_solar_days':21,'status':'See frozen comparison manifest; retrospective assessment shorter than requested fresh evidence'}
     if comparison:
         old_summary=comparison['load_validation' if kind=='load' else 'forecast_validation']
-        change=normalized(result,old_summary,kind)
+        change=normalized(comparison_result,old_summary,kind)
         material=[]
         for h in ('24','48','72'):
-            a=result['horizons'][h];b=old_summary['horizons'][h]
+            a=comparison_result['horizons'][h];b=old_summary['horizons'][h]
             if a.get('samples') and b.get('samples') and a['energy_mae_kwh']>b['energy_mae_kwh']*1.1+.25:material.append(h)
         metadata['assessment_primary_ratio']=change
         metadata['material_regressions']=material

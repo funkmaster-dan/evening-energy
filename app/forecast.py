@@ -1,5 +1,5 @@
 import joblib, numpy as np, pandas as pd
-from .config import DATA, read_json, write_json
+from .config import DATA, read_json, write_json, solar_banks
 from .sources import HomeAssistant, Calendar, consumption_weather, solar_weather
 from .datasets import features, bank_features, splice
 from .models import model_ready
@@ -168,14 +168,12 @@ class Forecaster:
     def run(self,settings,live,force=False):
         now=pd.Timestamp.now(tz='UTC'); end=forecast_end(settings,now)
         hours=pd.date_range(now.floor('h'),end.ceil('h'),freq='1h')
-        warnings=[]; ready_load=model_ready(settings,'load','load'); ready_solar=all(model_ready(settings,'solar-'+b.id,'solar',b.id) for b in settings.banks)
-        eta_meta=read_json('model-battery',{}); inv=read_json('model-inverter',{})
-        battery_ready=model_ready(settings,'battery','battery'); inverter_ready=model_ready(settings,'inverter','inverter')
+        warnings=[]; ready_load=model_ready(settings,'load','load'); ready_solar=all(model_ready(settings,'solar-'+b.id,'solar',b.id) for b in solar_banks(settings))
+        eta_meta=read_json('model-battery',{})
+        battery_ready=model_ready(settings,'battery','battery')
         if not ready_load: warnings.append('Consumption LightGBM needs calibration for the current configuration.')
-        if not ready_solar: warnings.append('One or more panel-bank models need calibration.')
+        if not ready_solar: warnings.append('Solar production model needs calibration for the current configuration.')
         if not battery_ready: warnings.append('Battery efficiencies need measured calibration.')
-        if not inverter_ready: warnings.append('CT / inverter efficiency needs calibration.')
-        if settings.solar_ct_proxy: warnings.append('Solar monitoring uses a PV proxy; inverter efficiency and achievable export are approximate until an independent AC/CT sensor is configured.')
         elapsed=now.timestamp()
         need_load=force or self.load_cache is None or elapsed-self.load_at>=settings.load_interval_minutes*60 or self.load_cache.index.max()<hours[-1]
         need_solar=force or self.solar_cache is None or elapsed-self.solar_at>=settings.solar_interval_minutes*60 or self.solar_cache.index.max()<hours[-1]
@@ -220,8 +218,8 @@ class Forecaster:
                 values['temperature_c']=weather['temperature_2m'].reindex(cache_hours).astype(object).where(lambda x:x.notna(),None).to_numpy() if weather_available else [None]*len(cache_hours)
                 self.load_cache=pd.DataFrame(values,index=cache_hours);self.load_at=elapsed
             if need_solar:
-                total=pd.DataFrame(0.,index=cache_hours,columns=['solar_low','solar_middle','solar_high','solar_point',*[f'solar_{k}_{b.id}' for b in settings.banks for k in ('low','middle','high','point')]])
-                for bank in settings.banks:
+                total=pd.DataFrame(0.,index=cache_hours,columns=['solar_low','solar_middle','solar_high','solar_point',*[f'solar_{k}_{b.id}' for b in solar_banks(settings) for k in ('low','middle','high','point')]])
+                for bank in solar_banks(settings):
                     name='solar-'+bank.id
                     if model_ready(settings,name,'solar',bank.id):
                         from .solar_training import solar_predict as bank_quantiles
@@ -234,8 +232,6 @@ class Forecaster:
                     else: pred={k:np.zeros(len(cache_hours)) for k in ('low','middle','high','point')}
                     for k in ('low','middle','high','point'):
                         total[f'solar_{k}_{bank.id}']=pred[k];total['solar_'+k]+=pred[k]
-                eff=inv.get('efficiency',.9) if inverter_ready else .9
-                total[['solar_low','solar_middle','solar_high','solar_point']]*=eff
                 self.solar_cache=total; self.solar_at=elapsed
         # Fifteen minute dispatch plus a partial first/final step. Preserve exact horizon duration.
         boundaries=[now]+list(pd.date_range(now.ceil('15min'),end,freq='15min'))+[end]
@@ -253,7 +249,7 @@ class Forecaster:
             row['charging_window']=any(inside(a.tz_convert(settings.timezone),w.start,w.end) for w in settings.charging_windows)
             row['net_demand_kw']=row['load_point']-row['solar_point'];row['net_demand_low']=row['load_low']-row['solar_high'];row['net_demand_high']=row['load_high']-row['solar_low'];rows.append(row)
         soc=live.get('soc'); age=snapshot_age(live,now)
-        trusted=bool(ready_load and ready_solar and battery_ready and inverter_ready and soc is not None and age<900)
+        trusted=bool(ready_load and ready_solar and battery_ready and soc is not None and age<900)
         if soc is not None and soc<settings.minimum_soc:warnings.append('Reported battery SoC is below the operating minimum; the projection retains the reported state.')
         if settings.mc_samples<500:warnings.append('Small Monte Carlo sample count: percentile and risk estimates may be unstable.')
         if soc is None: warnings.append('Battery SoC is unavailable or invalid in Home Assistant; export allowance is zero.')
@@ -262,7 +258,7 @@ class Forecaster:
         if missing:warnings.append('Live HA readings unavailable: '+', '.join(missing)+'. Historical forecasts remain in use.')
         eta_c=eta_meta.get('charge_efficiency',.9) if battery_ready else .9; eta_d=eta_meta.get('discharge_efficiency',.9) if battery_ready else .9
         usage=allowance_used(settings,now)
-        periods,history=energy_scenarios(settings,rows,now,inv.get('efficiency',.9) if inverter_ready else .9)
+        periods,history=energy_scenarios(settings,rows,now)
         trusted=trusted and bool(periods['periods'])
         history['status']='Forecast available; coverage not established' if trusted else 'Awaiting calibrated models and current SoC'
         mapping={'low':10,'middle':50,'high':90}
@@ -290,7 +286,7 @@ class Forecaster:
                 'warnings':warnings,'live':live,'outside_window_import_kwh':round(imports,3),
                 'model_updated_at':{'load':pd.Timestamp(self.load_at,unit='s',tz='UTC').isoformat(),'solar':pd.Timestamp(self.solar_at,unit='s',tz='UTC').isoformat()},
                 'uncertainty':history,'load_point_method':read_json('model-load',{}).get('point_method',{'head':'middle','baseline_weight':0}),'load_forecast_basis':LOAD_PIPELINE,'soc_band_method':POLICY,'weather_model':settings.weather_model,'quality_policy':QUALITY_POLICY,'source_policy':effective_policy(settings,'load'),
-                'calibration':{'charge_efficiency':eta_c,'discharge_efficiency':eta_d,'inverter_efficiency':inv.get('efficiency')},
+                'calibration':{'charge_efficiency':eta_c,'discharge_efficiency':eta_d},
                 'used_window_allowance_kwh':usage,
                 'energy_metric_basis':{'excess_kwh':'Stored battery energy above forecast household needs and configured minimum/reserve; not capped by export power or peak time',
                                        'achievable_export_kwh':'AC energy deliverable to the grid in the current/upcoming peak; limited by excess, discharge losses, inverter power and remaining time'},

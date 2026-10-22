@@ -42,7 +42,7 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(target.isna().all());self.assertTrue(flags.eq('frozen_solar_run').all())
             self.assertEqual(details['flat_runs'][0]['observable_at'],(self.index[12]+pd.Timedelta(hours=1)).isoformat())
             target,flags,details=clean_sensor(raw,'solar',40,self.s)
-            self.assertTrue(target.iloc[:12].notna().all());self.assertEqual(details['valid_plateaus'][0]['reason'],'frozen_solar_review')
+            self.assertTrue(target.isna().all());self.assertEqual(details['flat_runs'][0]['reason'],'frozen_solar_run')
         with patch('app.quality.dark_hours',return_value=np.ones(72,dtype=bool)):
             target,_,_=clean_sensor(raw*0,'solar',40,self.s,bounds*0);self.assertTrue(target.eq(0).all())
         with patch('app.quality.dark_hours',return_value=np.zeros(72,dtype=bool)):
@@ -89,7 +89,7 @@ class PreparationTests(unittest.TestCase):
     def test_complete_split_and_quiet_annotation(self):
         end=self.start+pd.Timedelta(hours=1,minutes=30)
         mask=training_mask(self.index[:3],self.start,end);self.assertEqual(mask.tolist(),[True,False,False])
-        raw=pd.Series(1.,index=self.index);away=pd.Series(True,index=self.index)
+        raw=pd.Series(np.linspace(1.,1.1,len(self.index)),index=self.index);away=pd.Series(True,index=self.index)
         with patch('app.quality.classify_background',return_value=(away,[],[])):
             q,_=quality_frame(raw,self.s)
         self.assertTrue(q.quiet_regime.all());self.assertTrue(q.validation_eligible.all());self.assertTrue(q.original_reason.eq('').all())
@@ -132,7 +132,6 @@ class DatasetOutageTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
         from app import datasets
-        from app.solar_training import solar_cases
         s=Settings(timezone='UTC');index=pd.date_range('2026-01-01',periods=96,freq='h',tz='UTC');entity=s.banks[0].entity
         values=pd.Series(1.,index=index);values.iloc[12]=np.nan;flags=pd.Series('',index=index);flags.iloc[12]='raw_history_unavailable'
         class FakeHA:
@@ -141,7 +140,7 @@ class DatasetOutageTests(unittest.TestCase):
                 f=pd.DataFrame({entity:values});f.attrs={'raw':f.copy(),'sensors':{entity:{'unit':'kW','quality_flags':flags,'original_quality_flags':flags,'statistics':pd.DataFrame({'min':0.,'max':2.},index=index),'details':{}}}};return f
         weather=pd.DataFrame({'temperature_2m':20.,'shortwave_radiation':500.,'tilted_irradiance':500.},index=index)
         req={'kind':'solar','bank_id':s.banks[0].id,'entities':[entity],'train_start':'2026-01-01','train_end':'2026-01-02','validation_start':'2026-01-03','validation_end':'2026-01-04','interpolate_hours':1}
-        with tempfile.TemporaryDirectory() as temp,patch.object(datasets,'DATA',Path(temp)),patch.object(datasets,'write_json'),patch.object(datasets,'HomeAssistant',FakeHA),patch.object(datasets,'solar_weather',return_value=weather),patch('app.solar_training.solar_cases',return_value=([],[])),patch('app.datasets.dark_hours',side_effect=lambda settings,ix:np.zeros(len(ix),dtype=bool)):
+        with tempfile.TemporaryDirectory() as temp,patch.object(datasets,'DATA',Path(temp)),patch.object(datasets,'write_json'),patch.object(datasets,'HomeAssistant',FakeHA),patch.object(datasets,'solar_weather',return_value=weather),patch('app.study.cases',return_value=([],[])),patch('app.datasets.dark_hours',side_effect=lambda settings,ix:np.zeros(len(ix),dtype=bool)):
             datasets.build_dataset(s,req,lambda message:None)
             f=pd.read_pickle(Path(temp)/('solar-'+s.banks[0].id+'.pkl'))['frame']
             self.assertTrue(pd.isna(f.target.iloc[12]));self.assertEqual(f.original_reason.iloc[12],'raw_history_unavailable');self.assertFalse(f.train_eligible.iloc[12])
@@ -150,7 +149,7 @@ class DatasetOutageTests(unittest.TestCase):
 class CalibrationPolicyTests(unittest.TestCase):
     def test_all_calibrations_require_current_preparation(self):
         from app.models import train
-        for kind in ('load','solar','battery','inverter'):
+        for kind in ('load','solar','battery'):
             with self.subTest(kind=kind),patch('app.models.read_json',return_value={'sufficient':True,'kind':kind,'quality':{'policy':'old-policy'}}):
                 with self.assertRaisesRegex(ValueError,'Prepare this dataset again'):train(Settings(),kind,lambda message:None)
 

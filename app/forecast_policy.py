@@ -18,7 +18,9 @@ def lead_groups(leads):
     return np.minimum(np.nan_to_num(np.asarray(leads,float),nan=0).astype(int)//24,2)
 
 def model_columns(model,default):
-    return list(getattr(model,'feature_name_',default))
+    names=getattr(model,'feature_name_',None)
+    if names is None and hasattr(model,'feature_name'):names=model.feature_name()
+    return list(names if names is not None else default)
 
 def ordered(raw,leads=None,calibration=None,dark=None):
     values=np.column_stack([np.asarray(raw[k],float) for k in ('low','middle','high')])
@@ -55,7 +57,7 @@ def fit_calibration(records,grouped=False,solar=False):
         for r in selected:
             if r['time'] not in chosen or r['origin']>chosen[r['time']]['origin']:chosen[r['time']]=r
         return list(chosen.values())
-    pooled_rows=distinct(rows) if solar else rows
+    pooled_rows=distinct(rows)
     minimum=24 if solar else 180
     days={pd.Timestamp(r['time']).date() for r in pooled_rows} if solar else {r['origin'][:10] for r in pooled_rows}
     if len(pooled_rows)<minimum or len(days)<3:return {}

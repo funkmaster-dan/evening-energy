@@ -16,6 +16,11 @@ class Constant:
         return np.full(len(x),self.value)
 
 class ForecastPolicy(unittest.TestCase):
+    def test_native_booster_columns_include_combined_bank_inputs(self):
+        from app.forecast_policy import model_columns
+        class Booster:
+            def feature_name(self):return ['tilted_irradiance','bank_irradiance_0','bank_irradiance_1']
+        self.assertEqual(model_columns(Booster(),LEGACY_SOLAR_FEATURES),['tilted_irradiance','bank_irradiance_0','bank_irradiance_1'])
     def test_endpoint_alignment_does_not_fill_a_missing_boundary(self):
         idx=pd.date_range('2026-01-01',periods=3,freq='h',tz='UTC')
         f=weather_intervals(pd.DataFrame({'temperature_2m':[10,20,30],'shortwave_radiation':[0,100,200]},index=idx))
@@ -34,6 +39,11 @@ class ForecastPolicy(unittest.TestCase):
         q=LoadPredictor(artifact).predict(x)
         self.assertEqual(q['point'][0],6)
         self.assertEqual([q[k][0] for k in ('low','middle','high')],[1,2,3])
+        artifact['point_method']['baseline_weight']=0
+        x['clock_profile']=np.nan
+        self.assertEqual(LoadPredictor(artifact).predict(x)['point'][0],8)
+        artifact['point_method']['baseline_weight']=.5
+        self.assertEqual(LoadPredictor(artifact).predict(x)['point'][0],8)
     def test_sparse_or_future_residuals_cannot_correct_an_issue(self):
         origin=pd.Timestamp('2026-01-04T00:00Z');policy={'days':3,'bound':.5,'taper':24}
         rows=[{'origin':origin.isoformat(),'time':(origin-pd.Timedelta(hours=5)).isoformat(),'actual':100,'point':0,'middle':0}]*100
@@ -66,6 +76,18 @@ class ForecastPolicy(unittest.TestCase):
         replay=predict(models,c,'load',artifact['point_method'],calibration)
         live=LoadPredictor(artifact).predict(x)
         for key in ('low','middle','high','point'):np.testing.assert_array_equal(replay[key],live[key])
+    def test_load_features_with_known_frozen_run_keep_the_same_columns(self):
+        from app.load_training import feature_rows
+        from app.datasets import FEATURES
+        index=pd.date_range('2026-01-01',periods=250,freq='h',tz='UTC')
+        frame=pd.DataFrame({k:np.ones(len(index)) for k in FEATURES},index=index)
+        frame['target']=np.arange(len(index),dtype=float)
+        frame.attrs['quality_runs']=[{'start':index[200].isoformat(),'end':index[225].isoformat(),
+            'reason':'frozen_power_run','observable_at':index[224].isoformat()}]
+        x=feature_rows(frame,index[-1],pd.DatetimeIndex([index[-1]]),'UTC')
+        self.assertEqual(list(x),LOAD_FEATURES)
+        self.assertEqual(x.lag1.iloc[0],247)
+        self.assertTrue(np.isnan(x.lag24.iloc[0]))
     def test_calibration_orders_then_clips_and_zeroes_darkness(self):
         q=ordered({'low':[-2,1],'middle':[1,2],'high':[0,3]},[0,72],{'pooled':{'low':5,'middle':-2,'high':0}},[False,True])
         self.assertTrue(q['low'][0]<=q['middle'][0]<=q['high'][0]);self.assertEqual(q['low'][0],0);self.assertEqual(q['high'][1],0)

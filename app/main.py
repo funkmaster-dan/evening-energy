@@ -8,10 +8,10 @@ from fastapi.staticfiles import StaticFiles
 from .config import Settings, load_settings, read_json, write_json, solar_banks
 from .sources import HomeAssistant, store_live
 from .ha_inputs import numeric_value, state_available, snapshot_age
-from .quality import physical, LOAD_PIPELINE, QUALITY_POLICY, effective_policy
+from .quality import physical, LOAD_PIPELINE, QUALITY_POLICY, active_policy
 from .setup import inspect_setup
 from .datasets import build_dataset, list_datasets
-from .models import train, list_models, list_candidates, promote_candidate, delete_candidate, clean_model_storage, clear_outdated_preparations
+from .models import train, list_models, list_candidates, promote_candidate, delete_candidate, clean_model_storage
 from .forecast import Forecaster
 from .battery import POLICY, export_active
 
@@ -30,9 +30,9 @@ def refresh_live():
         value=numeric_value(lookup.get(entity,{}),power)
         if not power or value is None:return value
         kind='battery_power' if entity==settings.battery_power_entity else 'load' if entity==settings.consumption_entity else 'solar'
-        limit=max(settings.battery_charge_limit_kw,settings.battery_discharge_limit_kw)*1.2 if kind=='battery_power' else effective_policy(settings,kind)['max_power_kw']
+        limit=max(settings.battery_charge_limit_kw,settings.battery_discharge_limit_kw)*1.2 if kind=='battery_power' else active_policy(settings,kind)['max_power_kw']
         bank=next((b for b in solar_banks(settings) if b.entity==entity),None)
-        if bank:limit=effective_policy(settings,'solar',read_json('dataset-solar-'+bank.id,{}).get('request',{}))['max_power_kw']
+        if bank:limit=active_policy(settings,'solar',bank.id)['max_power_kw']
         cleaned,_=physical(pd.Series([value]),kind,limit)
         return None if pd.isna(cleaned.iloc[0]) else float(cleaned.iloc[0])
     soc=value(settings.battery_soc_entity) if lookup.get(settings.battery_soc_entity,{}).get('attributes',{}).get('unit_of_measurement')=='%' else None
@@ -46,7 +46,6 @@ def refresh_live():
 async def update_forecast(force=False):
     global forecast,last_error
     async with forecast_lock:
-        if busy:return forecast
         runner=forecaster; current_settings=settings
         await asyncio.to_thread(refresh_live)
         result=await asyncio.to_thread(runner.run,current_settings,live,force)
@@ -65,10 +64,9 @@ def start_job(label,fn):
     async def worker():
         global busy,last_error
         try:
-            # Let any existing projection finish before calibration takes CPU.
-            async with forecast_lock:pass
             await asyncio.to_thread(fn,progress)
             jobs[id].update(status='complete',message='Complete')
+            last_error=None
         except Exception as exc:
             log.exception('Job failed'); jobs[id].update(status='failed',message=str(exc)); last_error=str(exc)
         finally:
@@ -84,7 +82,7 @@ async def scheduler():
                 now=time.time()
                 if now-last_live>=settings.live_interval_seconds:
                     await asyncio.to_thread(refresh_live); last_live=now
-                if not busy and (not forecast or now-last_forecast>=settings.battery_interval_minutes*60 or forecaster.load_at==0 or forecaster.solar_at==0):
+                if not forecast or now-last_forecast>=settings.battery_interval_minutes*60 or forecaster.load_at==0 or forecaster.solar_at==0:
                     try: await update_forecast()
                     finally: last_forecast=now
         except Exception as exc:
@@ -96,7 +94,6 @@ async def lifespan(app):
     global forecast
     settings.save()
     forecast={};write_json('forecast',{})
-    clear_outdated_preparations()
     clean_model_storage(settings)
     task=asyncio.create_task(scheduler())
     yield
@@ -216,12 +213,16 @@ async def calibration(dataset_id:str):
 
 @app.post('/api/models/{dataset_id}/promote')
 async def promote(dataset_id:str):
+    global busy,forecaster
     if busy: raise HTTPException(409,'Wait for the current job to finish.')
-    async with forecast_lock:
-        try: result=promote_candidate(settings,dataset_id)
+    busy=True
+    try:
+        try: result=await asyncio.to_thread(promote_candidate,settings,dataset_id)
         except ValueError as exc: raise HTTPException(400,str(exc))
-        forecaster.reset(); forecast.clear()
+        # An in-flight forecast uses its old runner and will discard its result.
+        forecaster=Forecaster(); forecast.clear()
         write_json('forecast',{})
+    finally:busy=False
     return result
 
 @app.delete('/api/models/{dataset_id}/candidate')

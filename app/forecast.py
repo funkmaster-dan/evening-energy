@@ -6,7 +6,7 @@ from .models import model_ready
 from .ha_inputs import snapshot_age
 from .forecast_policy import record_issue,settled_records,recent_correction,SETTLEMENT_HOURS
 from .load_training import LoadPredictor
-from .quality import QUALITY_POLICY, effective_policy, LOAD_PIPELINE, quality_frame, target_bounds, load_context_metadata, attach_load_context
+from .quality import QUALITY_POLICY, active_policy, LOAD_PIPELINE, quality_frame, target_bounds, load_context_metadata, attach_load_context
 from .uncertainty import energy_scenarios
 from .battery import (inside, export_active, export_rate, window_day, simulate_paths, allowances, acceptable, export_periods, plan_exports,
                       POLICY, IMPORT_TOLERANCE_KWH, RESERVE_TOLERANCE_SOC, DELIVERY_TOLERANCE_KWH)
@@ -192,11 +192,11 @@ class Forecaster:
             if calendar.summary(hours)['missing_school_hours']:warnings.append('School calendar does not cover the forecast period.')
             if need_load:
                 history_start=hours[0]-pd.Timedelta(days=58)
-                policy=effective_policy(settings,'load')
-                recent=HomeAssistant(settings).frame(settings.historical_consumption_entities,history_start,hours[0],measurement_kind='load',max_power_kw=policy['max_power_kw'],units=policy['units'],corrections=policy['corrections'])
-                observed=splice(recent,settings.historical_consumption_entities,read_json('dataset-load',{}).get('request',{}).get('combine','splice')) if not recent.empty else pd.Series(dtype=float,index=pd.DatetimeIndex([],tz='UTC'))
-                context,quality=quality_frame(observed,settings,'load',policy['max_power_kw'],corrections=read_json('dataset-load',{}).get('request',{}).get('corrections',[]),minmax=target_bounds(recent,settings.historical_consumption_entities))
-                metadata=load_context_metadata(recent,settings.historical_consumption_entities,settings,quality,read_json('dataset-load',{}).get('request',{}).get('combine','splice'),policy['max_power_kw'])
+                policy=active_policy(settings,'load');history_entities=policy['entities'] or settings.historical_consumption_entities
+                recent=HomeAssistant(settings).frame(history_entities,history_start,hours[0],measurement_kind='load',max_power_kw=policy['max_power_kw'],units=policy['units'],corrections=policy['corrections'])
+                observed=splice(recent,history_entities,policy['combine']) if not recent.empty else pd.Series(dtype=float,index=pd.DatetimeIndex([],tz='UTC'))
+                context,quality=quality_frame(observed,settings,'load',policy['max_power_kw'],corrections=policy['corrections'],minmax=target_bounds(recent,history_entities))
+                metadata=load_context_metadata(recent,history_entities,settings,quality,policy['combine'],policy['max_power_kw'])
                 context.attrs={};f.attrs={}
                 f=pd.concat([context,f]).sort_index();attach_load_context(f,metadata)
                 profile=read_json('model-load',{}).get('hour_profile',{})
@@ -285,7 +285,7 @@ class Forecaster:
                 'planned_export_window':{'start':rows[peak_indices[0]]['time'],'end':cutoff.isoformat(),'discharge_rate_kw':projections['middle']['discharge_rate_kw']} if peak_indices else None,
                 'warnings':warnings,'live':live,'outside_window_import_kwh':round(imports,3),
                 'model_updated_at':{'load':pd.Timestamp(self.load_at,unit='s',tz='UTC').isoformat(),'solar':pd.Timestamp(self.solar_at,unit='s',tz='UTC').isoformat()},
-                'uncertainty':history,'load_point_method':read_json('model-load',{}).get('point_method',{'head':'middle','baseline_weight':0}),'load_forecast_basis':LOAD_PIPELINE,'soc_band_method':POLICY,'weather_model':settings.weather_model,'quality_policy':QUALITY_POLICY,'source_policy':effective_policy(settings,'load'),
+                'uncertainty':history,'load_point_method':read_json('model-load',{}).get('point_method',{'head':'middle','baseline_weight':0}),'load_forecast_basis':LOAD_PIPELINE,'soc_band_method':POLICY,'weather_model':settings.weather_model,'quality_policy':QUALITY_POLICY,'source_policy':active_policy(settings,'load'),
                 'calibration':{'charge_efficiency':eta_c,'discharge_efficiency':eta_d},
                 'used_window_allowance_kwh':usage,
                 'energy_metric_basis':{'excess_kwh':'Stored battery energy above forecast household needs and configured minimum/reserve; not capped by export power or peak time',

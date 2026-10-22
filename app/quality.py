@@ -79,7 +79,7 @@ def clean_sensor(values,kind='load',limit=40,settings=None,minmax=None,cutoff=No
             if dark.any() and level>.005:
                 fault='frozen_solar_run';known=part.index[dark][0]+pd.Timedelta(hours=1)
                 evidence='Unchanged positive solar power continues into full darkness; min/max are not required when no variation contradicts the freeze'
-            elif dt>=24 and (~dark).any():
+            elif dt>=24 and level<=.005 and (~dark).any():
                 fault='frozen_solar_run';known=start+pd.Timedelta(hours=24);evidence='Unchanged near-zero production persists for at least 24 hours including daylight; excluded as a stuck reading or production outage'
             elif dt>=6:
                 retained.append({'start':start.isoformat(),'hours':dt,'reason':'Normal night zeros or daytime clipping/curtailment remain valid'})
@@ -305,5 +305,16 @@ def attach_load_context(frame,metadata):
 
 
 def effective_policy(settings,kind,request=None):
-    request=request if request is not None else read_json('dataset-'+kind,{}).get('request',{})
+    request=request or {}
     return {'max_power_kw':float(request.get('max_power_kw',settings.load_max_power_kw if kind=='load' else settings.solar_max_power_kw)), 'corrections':request.get('corrections',[]),'units':request.get('units') or ({request['entities'][0]:request['unit']} if request.get('unit') and len(request.get('entities',[]))==1 else {}),'quality_policy':QUALITY_POLICY,'combine':request.get('combine','splice'),'entities':request.get('entities',[])}
+
+
+def active_policy(settings,kind,bank_id=None):
+    """Preparing another dataset must not change the active model's inputs."""
+    name='solar-'+bank_id if kind=='solar' and bank_id else kind
+    metadata=read_json('model-'+name,{})
+    request=metadata.get('training_policy')
+    if request is None:
+        request=metadata.get('config_signature',{}).copy()
+        if kind=='load':request['corrections']=request.get('quality_corrections',[])
+    return effective_policy(settings,kind,request)

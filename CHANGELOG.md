@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.2.1
+
+- Replace routine model searches with bounded LightGBM fitting and energy-aware stopping on chronological development forecasts.
+- Save stopping and validation forecasts during preparation so training and candidate activation can run offline.
+- Preserve prepared data and pending candidates across code updates; keep active model inputs independent of new preparations.
+- Keep forecasts refreshing during training and compare active/candidate metrics on identical validation issues.
+
 ## v1.2.0
 
 - Add combined solar production models using one measured AC sensor, panel counts and bank orientations.

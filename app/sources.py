@@ -229,10 +229,10 @@ def forecast_weather(settings,start,end,model='ecmwf_ifs'):
     f=weather_intervals(f[columns]); f.attrs.update(run=None,run_basis='Stitched operational response; initialization unknown'); f.to_pickle(file); return f
 
 
-def solar_weather(settings,bank,start,end,historical=False,issued_at=None):
+def solar_weather(settings,bank,start,end,historical=False,issued_at=None,cached_only=False):
     """Open-Meteo GTI for a bank or panel-count-weighted combined layout."""
     if bank.id == '__combined':
-        frames=[(b,solar_weather(settings,b,start,end,historical=historical,issued_at=issued_at)) for b in settings.banks]
+        frames=[(b,solar_weather(settings,b,start,end,historical=historical,issued_at=issued_at,cached_only=cached_only)) for b in settings.banks]
         result=frames[0][1].copy()
         count=sum(b.panel_count for b,_ in frames)
         for i,(b,f) in enumerate(frames):result[f'bank_irradiance_{i}']=f['tilted_irradiance']*b.panel_count/count
@@ -250,10 +250,12 @@ def solar_weather(settings,bank,start,end,historical=False,issued_at=None):
     if path.exists() and (historical or run is not None or time.time()-path.stat().st_mtime<1200):
         return pd.read_pickle(path)
     if run is not None:
-        prefix=f'solar-weather-v2-{settings.latitude:.6f}-{settings.longitude:.6f}-{bank.tilt:g}-{bank.azimuth:g}-{model}-{mode}-'
-        for cached in DATA.glob(prefix+'*.pkl'):
-            frame=pd.read_pickle(cached)
-            if frame.index.min()<=start and frame.index.max()>=end-pd.Timedelta(hours=1) and frame.attrs.get('run')==run.isoformat():return frame
+        for version in ('v3','v2'):
+            prefix=f'solar-weather-{version}-{settings.latitude:.6f}-{settings.longitude:.6f}-{bank.tilt:g}-{bank.azimuth:g}-{model}-{mode}-'
+            for cached in DATA.glob(prefix+'*.pkl'):
+                frame=pd.read_pickle(cached)
+                if frame.index.min()<=start and frame.index.max()>=end-pd.Timedelta(hours=1) and frame.attrs.get('run')==run.isoformat():return frame
+    if cached_only:raise ValueError('Archived solar weather is not cached')
     params={'latitude':settings.latitude,'longitude':settings.longitude,'hourly':'temperature_2m,shortwave_radiation,global_tilted_irradiance','timezone':'UTC','tilt':bank.tilt,'azimuth':(bank.azimuth%360)-180}
     if run is not None:
         ranges=[(start,end,'https://single-runs-api.open-meteo.com/v1/forecast')]
@@ -263,7 +265,7 @@ def solar_weather(settings,bank,start,end,historical=False,issued_at=None):
     else:
         ranges=[(start,end,'https://api.open-meteo.com/v1/forecast')]
     chunks=[]
-    with httpx.Client(timeout=120) as client:
+    with httpx.Client(timeout=30 if run is not None else 120) as client:
         for left,right,url in ranges:
             if left>right: continue
             q={**params,'start_date':str(left.date()),'end_date':str((right+pd.Timedelta(days=1)).date())}
@@ -290,13 +292,14 @@ def solar_weather(settings,bank,start,end,historical=False,issued_at=None):
     return result
 
 
-def consumption_weather(settings,start,end,historical=False,issued_at=None):
+def consumption_weather(settings,start,end,historical=False,issued_at=None,cached_only=False):
     """Selected-model weather runs without any panel geometry dependency."""
     if issued_at is None:
         return Weather(settings).fetch(start,end,historical=True) if historical else forecast_weather(settings,start,end,settings.weather_model)
     run=archived_run(issued_at)
     path=DATA/f'load-weather-v2-{settings.latitude:.6f}-{settings.longitude:.6f}-{settings.weather_model}-{run.strftime("%Y%m%d%H")}.pkl'
     if path.exists():return pd.read_pickle(path)
+    if cached_only:raise ValueError('Archived consumption weather is not cached')
     q={'latitude':settings.latitude,'longitude':settings.longitude,'models':settings.weather_model,'run':run.strftime('%Y-%m-%dT%H:%M'),'forecast_days':7,'hourly':'temperature_2m,shortwave_radiation','timezone':'UTC'}
     with httpx.Client(timeout=30) as client:
         response=client.get('https://single-runs-api.open-meteo.com/v1/forecast',params=q);response.raise_for_status();f=pd.DataFrame(response.json()['hourly'])

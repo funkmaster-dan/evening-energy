@@ -1,9 +1,8 @@
 import json
-from datetime import datetime
 import numpy as np, pandas as pd, pvlib
-from .config import DATA, write_json, read_json, solar_banks, solar_configuration
+from .config import DATA, write_json, read_json, solar_banks
 from .sources import HomeAssistant, Weather, Calendar, solar_weather
-from .load_splits import inventory, recommendations, training_mask, split_coverage
+from .load_splits import training_mask, split_coverage
 from .quality import QUALITY_POLICY, LOAD_PIPELINE, quality_frame, dark_hours, physical, battery_quality, target_bounds, load_context_metadata, attach_load_context, effective_policy, history_availability, exclusion_report
 
 FEATURES=['temperature_2m','shortwave_radiation','hour_sin','hour_cos','year_sin','year_cos','weekday','weekend','public_holiday','school_holiday','school_calendar_known']
@@ -57,6 +56,7 @@ def splice(frame, entities, mode='splice'):
     return f.iloc[:,::-1].bfill(axis=1).iloc[:,0]
 
 def build_dataset(settings, req, progress):
+    from .models import signature
     kind=req['kind']
     if kind not in ('load','solar','battery'):raise ValueError('Choose consumption, solar production or battery efficiency')
     dataset_id=kind if kind in ('load','battery') else 'solar-'+req['bank_id']
@@ -181,35 +181,22 @@ def build_dataset(settings, req, progress):
     sufficient=len(train)>=minimum and len(valid)>=24
     if kind=='solar':sufficient=sufficient and int(train.measurement_valid.sum())>=100
     manifest={'quality_policy':QUALITY_POLICY,'training_start':start.isoformat(),'training_end':train_end.isoformat(),'final_periods':[{'start':val_start.isoformat(),'end':end.isoformat(),'reason':'Explicit user dates; untouched final test'}]}
-    if kind=='load':
-        fvalid=cleaned.loc[(cleaned.index>=val_start)&(cleaned.index<end)]
-        raw_counts={str(h):int(fvalid.validation_eligible.astype(int).rolling(h).sum().eq(h).sum()) for h in (24,48,72)}
-        from .load_training import evaluation_cases
-        cases=evaluation_cases(cleaned,val_start,end,settings,progress)
-        counts={str(h):sum(len(c['hours'])>=h for c in cases) for h in (24,48,72)}
-        manifest['raw_contiguous_target_windows']=raw_counts
-        manifest['usable_issue_origins']=[c['origin'].isoformat() for c in cases]
-        manifest['distinct_issue_days']={str(h):len({str(c['origin'].tz_convert(settings.timezone).date()) for c in cases if len(c['hours'])>=h}) for h in (24,48,72)}
-        manifest['weather_sources']={label:sum(c['archive']==archive for c in cases) for label,archive in [('archived',True),('historical_proxy',False)]}
-        manifest['discarded_windows']=cases[-1]['skipped'] if cases else {'reason':'No origin has complete targets, context/clock profile and weather'}
-        sufficient=sufficient and (end-val_start)>=pd.Timedelta(days=4) and counts['72']>0 and len(valid)>=96
-        manifest['complete_windows']=counts;manifest['eligible_hours']=len(valid);manifest['excluded_hours']=int((~fvalid.validation_eligible|fvalid.target.isna()).sum())
-        manifest['recommendation']='Reserve 28–56 recent days, at least ten distinct issue days with complete 72h/overnight windows. Four days is an experiment minimum.'
-        manifest['eligible_target_hours']=[t.isoformat() for t in valid.index]
-        manifest['coverage_only_inventory']=inventory(cleaned,val_start,end,settings)
-        manifest['holdout_recommendation']=recommendations(cleaned,start,end,settings)
-        extra['split_manifest']=manifest
-    if kind=='solar':
-        from .solar_training import solar_cases
-        provisional={'frame':cleaned,'start':start,'train_end':train_end,'val_start':val_start,'end':end}
-        cases,skipped=solar_cases(settings,bank,provisional,progress)
-        counts={str(h):sum(c['valid_window'](c['origin']+pd.Timedelta(hours=h)) is not None for c in cases if c['origin']+pd.Timedelta(hours=h)<=end) for h in (24,48,72)}
-        manifest.update(complete_windows=counts,usable_issue_origins=[c['origin'].isoformat() for c in cases],discarded_windows=skipped)
-        sufficient=sufficient and any(c['valid_window'](c['daily_end']) is not None for c in cases)
+    validation_cases=[];skipped=[];development=None
+    if kind in ('load','solar'):
+        from .study import cases,window
+        from .fitting import development_cases
+        if sufficient:development=development_cases(cleaned,start,train_end,settings,kind,bank,progress)
+        progress('Saving issued-weather validation for offline training')
+        validation_cases,skipped=cases(cleaned,val_start,end,settings,kind,bank,progress=progress)
+        counts={str(h):sum(window(c,h) is not None for c in validation_cases) for h in (24,48,72)}
+        manifest.update(complete_windows=counts,usable_issue_origins=[c['origin'].isoformat() for c in validation_cases],discarded_windows=skipped)
+        sufficient=sufficient and bool(validation_cases)
+        if kind=='load':sufficient=sufficient and (end-val_start)>=pd.Timedelta(days=4) and counts['72']>0 and len(valid)>=96
         extra['split_manifest']=manifest
     preview=cleaned.loc[(cleaned.index>=start)&available];series=preview['target'] if 'target' in preview else preview.iloc[:,0]
-    summary={'solar_configuration':solar_configuration(settings,bank.id) if bank else None,'id':dataset_id,'preparation_version':2,'kind':kind,'bank_id':req.get('bank_id'),'request':req,'created_at':pd.Timestamp.now(tz='UTC').isoformat(),'rows':len(cleaned),'training_rows':len(train),'validation_rows':len(valid),'coverage_pct':round(100*(len(train)+len(valid))/max(1,len(expected[expected>=start])),1),'sufficient':sufficient,'readiness':'Ready to calibrate' if sufficient else ('LightGBM needs 7 measured training days, 4 validation days and a complete 72-hour window with prior context' if kind=='load' else 'Need measured solar training targets, a complete measured daylight validation day and archived weather' if kind=='solar' else f'Need at least {minimum} training rows and 24 validation rows'),'recommendation':'Use one or several comparable years for seasonal learning and 28–56 final validation days; shorter periods are experiments.','sources':entities,**extra,**dataset_preview(series)}
-    pd.to_pickle({'frame':cleaned,'start':start,'train_end':train_end,'val_start':val_start,'end':end,'entities':entities,'split_manifest':manifest,'source_metadata':raw.attrs}, DATA/(dataset_id+'.pkl'))
+    summary={'model_settings':signature(settings,kind,bank.id if bank else None),'id':dataset_id,'kind':kind,'bank_id':req.get('bank_id'),'request':req,'created_at':pd.Timestamp.now(tz='UTC').isoformat(),'rows':len(cleaned),'training_rows':len(train),'validation_rows':len(valid),'coverage_pct':round(100*(len(train)+len(valid))/max(1,len(expected[expected>=start])),1),'sufficient':sufficient,'validation_saved':bool(validation_cases),'readiness':'Ready to calibrate' if sufficient else ('LightGBM needs 7 measured training days, 4 validation days and a complete 72-hour window with prior context' if kind=='load' else 'Need measured solar training targets, a complete measured daylight validation day and archived weather' if kind=='solar' else f'Need at least {minimum} training rows and 24 validation rows'),'recommendation':'Use one or several comparable years for seasonal learning and 28–56 final validation days; shorter periods are experiments.','sources':entities,**extra,**dataset_preview(series)}
+    pd.to_pickle({'frame':cleaned,'start':start,'train_end':train_end,'val_start':val_start,'end':end,'entities':entities,'split_manifest':manifest,'development':development,'validation_cases':validation_cases,'validation_skipped':skipped}, DATA/(dataset_id+'.tmp'))
+    (DATA/(dataset_id+'.tmp')).replace(DATA/(dataset_id+'.pkl'))
     write_json('dataset-'+dataset_id,summary)
     progress(f'Dataset built: {len(train)} training rows, {len(valid)} validation rows')
     return summary
@@ -230,10 +217,19 @@ def list_datasets(settings=None):
             series=frame['target'] if 'target' in frame else frame.iloc[:,0]
             summary.update(dataset_preview(series))
             write_json(path.stem,summary)
-        if settings is not None and summary.get('kind')=='solar':
-            try:matches=summary.get('solar_configuration')==solar_configuration(settings,summary.get('bank_id'))
-            except ValueError:matches=False
-            if not matches:summary={**summary,'sufficient':False,'readiness':'Solar settings have changed or this dataset predates configuration checks. Prepare data again.'}
+        if summary.get('kind') in ('load','solar') and frame_path.exists():
+            # Only inspect the pickle when upgrading an older prepared dataset.
+            # The summary records availability, not a code version or timestamp.
+            if 'validation_saved' not in summary:
+                summary['validation_saved']=bool(pd.read_pickle(frame_path).get('validation_cases'))
+                write_json(path.stem,summary)
+            if not summary['validation_saved']:
+                summary={**summary,'sufficient':False,'readiness':'Prepare data again to save validation for offline training.'}
+        if settings is not None and summary.get('model_settings') is not None:
+            from .models import signature
+            try:matches=summary['model_settings']==signature(settings,summary['kind'],summary.get('bank_id'))
+            except (ValueError,StopIteration):matches=False
+            if not matches:summary={**summary,'sufficient':False,'readiness':'Model inputs have changed. Prepare data again.'}
         summaries.append(summary)
     return summaries
 

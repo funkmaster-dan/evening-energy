@@ -1,13 +1,11 @@
 """Direct load/solar models and measured battery calibration."""
 import warnings
-from pathlib import Path
 warnings.filterwarnings('ignore',message='X does not have valid feature names')
 import numpy as np, pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from .config import DATA, read_json, write_json, solar_banks, solar_configuration
-from .datasets import SOLAR_PIPELINE
 from .load_splits import training_mask
-from .quality import LOAD_PIPELINE, QUALITY_POLICY, effective_policy
+from .quality import QUALITY_POLICY
 
 def metrics(y,p):
     return {'mae':round(float(mean_absolute_error(y,p)),4),'rmse':round(float(np.sqrt(mean_squared_error(y,p))),4),'r2':round(float(r2_score(y,p)),4) if len(y)>1 else 0,'samples':len(y)}
@@ -21,6 +19,8 @@ def train(settings,dataset_id,progress):
     summary=read_json('dataset-'+dataset_id)
     if not summary or not summary['sufficient']: raise ValueError('Build a sufficient dataset first.')
     if summary.get('quality',{}).get('policy')!=QUALITY_POLICY:raise ValueError('Prepare this dataset again for the current cleaning policy.')
+    if summary.get('model_settings') is not None and summary['model_settings']!=signature(settings,summary['kind'],summary.get('bank_id')):
+        raise ValueError('Model inputs have changed. Prepare data again.')
     if read_json('candidate-'+dataset_id): raise ValueError('Promote or delete the existing candidate before calibrating again.')
     if summary['kind']=='solar' and summary.get('bank_id') not in {b.id for b in solar_banks(settings)}: raise ValueError('Prepare a solar dataset for the current sensor mode')
     d=pd.read_pickle(DATA/(dataset_id+'.pkl')); f=d['frame']; kind=summary['kind']
@@ -31,7 +31,6 @@ def train(settings,dataset_id,progress):
         write_json('candidate-'+dataset_id,metadata)
         return metadata
     elif kind=='solar':
-        if summary.get('solar_configuration') != solar_configuration(settings,summary.get('bank_id')):raise ValueError('Solar settings have changed or this dataset predates configuration checks. Prepare data again.')
         from .solar_training import train_solar
         metadata=train_solar(settings,summary,d,metadata,progress)
         write_json('candidate-'+dataset_id,metadata)
@@ -75,26 +74,33 @@ def combined_configuration(settings):
 
 
 def signature(settings,kind,bank_id=None):
-    policy=effective_policy(settings,kind) if kind in ('load','solar') else {'quality_policy':QUALITY_POLICY}
-    if kind=='solar':policy=effective_policy(settings,kind,read_json('dataset-solar-'+bank_id,{}).get('request',{}))
-    if kind=='load': return {**policy,'load_pipeline':LOAD_PIPELINE,'quality_policy':QUALITY_POLICY,'weather_model':settings.weather_model,'load_max_power_kw':settings.load_max_power_kw,'quality_corrections':read_json('dataset-load',{}).get('request',{}).get('corrections',[]),'location':[settings.latitude,settings.longitude],'timezone':settings.timezone,'state':settings.state,'school_calendar_url':settings.school_calendar_url,'entities':settings.historical_consumption_entities}
+    context={'location':[settings.latitude,settings.longitude],'timezone':settings.timezone,'weather_model':settings.weather_model}
+    if kind=='load': return {**context,'load_max_power_kw':settings.load_max_power_kw,'state':settings.state,'school_calendar_url':settings.school_calendar_url,'entities':settings.historical_consumption_entities}
     if kind=='solar':
         b=next(b for b in solar_banks(settings) if b.id==bank_id)
-        geometry={'combined':combined_configuration(settings),'mode':'combined-ac-v1'} if bank_id=='__combined' else {'bank':b.model_dump(exclude={'panel_count'})}
-        return {**policy,'location':[settings.latitude,settings.longitude],'timezone':settings.timezone,**geometry,'solar_pipeline':SOLAR_PIPELINE,'weather_model':settings.weather_model}
-    if kind=='battery': return {**policy,'capacity':settings.battery_capacity_kwh,'power':settings.battery_power_entity,'soc':settings.battery_soc_entity}
+        geometry={'combined':combined_configuration(settings),'mode':'combined-ac-v1'} if bank_id=='__combined' else {'bank':b.model_dump(exclude={'panel_count','name'})}
+        return comparable_settings({**context,**geometry},kind)
+    if kind=='battery': return {'capacity':settings.battery_capacity_kwh,'power':settings.battery_power_entity,'soc':settings.battery_soc_entity}
     raise ValueError('Unsupported model type')
+
+def comparable_settings(saved,kind):
+    # Older models mixed dataset options and software labels into this snapshot.
+    saved={k:v for k,v in saved.items() if k not in {'quality_policy','load_pipeline','solar_pipeline','max_power_kw','corrections','quality_corrections','units','combine'}}
+    if kind=='solar':
+        saved.pop('entities',None)
+        if 'bank' in saved:saved['bank']={k:v for k,v in saved['bank'].items() if k not in {'name','panel_count'}}
+        if 'combined' in saved:saved['combined']={k:v for k,v in saved['combined'].items() if k!='version'}
+    return saved
+
+def settings_match(settings,metadata):
+    try:return comparable_settings(metadata.get('config_signature',{}),metadata['kind'])==signature(settings,metadata['kind'],metadata.get('bank_id'))
+    except (ValueError,StopIteration):return False
 
 def model_ready(settings,name,kind,bank_id=None):
     if kind not in ('load','solar','battery'):return False
     if kind=='solar' and bank_id not in {b.id for b in solar_banks(settings)}: return False
     meta=read_json('model-'+name)
-    legacy=meta and ((kind=='solar' and meta.get('solar_pipeline')=='open-meteo-gti-angles-quantile-v2') or (kind=='load' and meta.get('pipeline')=='lightgbm-quantile-direct-v2'))
-    if legacy:
-        old=meta.get('config_signature',{}).copy();current=signature(settings,kind,bank_id).copy()
-        old.pop('solar_pipeline' if kind=='solar' else 'load_pipeline',None);current.pop('solar_pipeline' if kind=='solar' else 'load_pipeline',None)
-        return old==current and all(p.exists() for p in artifact_paths(name))
-    return bool(meta and (kind!='load' or meta.get('pipeline')==LOAD_PIPELINE) and meta.get('config_signature')==signature(settings,kind,bank_id) and all(p.exists() for p in artifact_paths(name)))
+    return bool(meta and settings_match(settings,meta) and all(p.exists() for p in artifact_paths(name)))
 
 def list_models(): return [read_json(p.stem) for p in sorted(DATA.glob('model-*.json')) if p.stem!='model-inverter']
 
@@ -111,33 +117,14 @@ def promote_candidate(settings,dataset_id):
     metadata=read_json('candidate-'+dataset_id)
     if not metadata: raise ValueError('Candidate not found')
     if metadata.get('kind') not in ('load','solar','battery'):raise ValueError('Unsupported model type')
-    if dataset_id=='load' and metadata.get('pipeline')!=LOAD_PIPELINE: raise ValueError('Rebuild and calibrate the load dataset first')
-    if metadata['config_signature']!=signature(settings,metadata['kind'],metadata.get('bank_id')):
+    if not settings_match(settings,metadata):
         raise ValueError('Configuration has changed. Delete this candidate and calibrate again.')
     sources=artifact_paths(dataset_id,True); targets=artifact_paths(dataset_id)
     if any(not p.exists() for p in sources): raise ValueError('Candidate artifact is missing. Delete it and calibrate again.')
     if sources:
         import joblib
-        artifact=joblib.load(sources[0]);models=artifact.get('models',artifact)
-        if set(models)!= {'low','middle','high'}:raise ValueError('Candidate lacks quantile heads')
-        d=pd.read_pickle(DATA/(dataset_id+'.pkl'));frame=d['frame']
-        if dataset_id=='load':
-            from .load_training import evaluation_cases,LoadPredictor
-            cases=evaluation_cases(frame,d['val_start'],d['end'],settings,issued_weather=False)
-            if not cases:raise ValueError('No operational load validation case')
-            predicted=LoadPredictor(artifact).predict(cases[0]['x'])
-        else:
-            from .solar_training import solar_predict
-            from .datasets import SOLAR_FEATURES,bank_features
-            if any(c.startswith('bank_irradiance_') and c not in frame for c in artifact.get('features',[])):
-                from .sources import solar_weather
-                bank=next(b for b in solar_banks(settings) if b.id==metadata['bank_id'])
-                weather=solar_weather(settings,bank,d['start'],d['end'],historical=True)
-                frame=frame.copy()
-                for c in weather.columns:
-                    if c.startswith('bank_irradiance_'):frame[c]=weather[c].reindex(frame.index)
-            predicted=solar_predict(artifact,frame.dropna(subset=[c for c in SOLAR_FEATURES if c not in ('weather_run_age','lead_hours')]).iloc[-24:])
-        if any(not np.isfinite(values).all() for values in predicted.values()):raise ValueError('Candidate predictions must be finite')
+        try:validate_artifact(joblib.load(sources[0]),metadata['kind'])
+        except Exception as exc:raise ValueError('Cannot use this candidate: '+str(exc)) from exc
     for source,target in zip(sources,targets): source.replace(target)
     # Keep paired validation evidence with the promoted model.
     write_json('model-'+dataset_id,metadata)
@@ -150,17 +137,30 @@ def delete_candidate(dataset_id):
     for path in [*artifact_paths(dataset_id,True),DATA/('candidate-'+dataset_id+'.json')]: path.unlink(missing_ok=True)
 
 
-def clear_outdated_preparations():
-    """A code update requires preparing data again; recorded history stays intact."""
-    updated=max(p.stat().st_mtime for p in Path(__file__).parent.glob('*.py'))
-    for path in DATA.glob('dataset-*.json'):
-        summary=read_json(path.stem,{})
-        name=summary.get('id')
-        if not name:continue
-        prepared=DATA/(name+'.pkl')
-        if prepared.exists() and prepared.stat().st_mtime>=updated:continue
-        for stale in (path,prepared,DATA/('candidate-'+name+'.json'),*artifact_paths(name,True)):
-            stale.unlink(missing_ok=True)
+def validate_artifact(artifact,kind):
+    """A small local prediction check; activation never needs history or weather."""
+    from .forecast_policy import model_columns
+    models=artifact.get('models',artifact)
+    if set(models)!={'low','middle','high'}:raise ValueError('Candidate lacks quantile heads')
+    if kind=='load':
+        from .load_training import LoadPredictor,LOAD_FEATURES
+        columns=LOAD_FEATURES
+        predict=LoadPredictor(artifact).predict
+    else:
+        from .solar_training import solar_predict
+        from .datasets import SOLAR_FEATURES
+        columns=SOLAR_FEATURES
+        predict=lambda x:solar_predict(artifact,x)
+    probe=artifact.get('validation_probe')
+    if probe is None:
+        # Older candidates have no saved sample. Check their own feature names.
+        columns=list(dict.fromkeys([*columns,*(c for model in models.values() for c in model_columns(model,columns))]))
+        probe=pd.DataFrame(0.,index=[0],columns=columns)
+        probe['weather_run_age']=np.nan
+    if probe.empty:raise ValueError('Candidate prediction sample is empty')
+    predicted=predict(probe)
+    if any(len(values)!=len(probe) or not np.isfinite(values).all() for values in predicted.values()):
+        raise ValueError('Candidate predictions must be finite')
 
 
 def clean_model_storage(settings):

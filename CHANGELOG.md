@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.2
+
+- Show consumption and solar history as interpolated hourly averages, matching the forecast presentation.
+- Keep completed-hour averages fixed and connect the latest hour's average so far to its measurement cutoff using the same solid line.
+- Preserve five-minute battery history and clarify the power averaging basis in chart tooltips.
+
 ## v1.2.1
 
 - Replace routine model searches with bounded LightGBM fitting and energy-aware stopping on chronological development forecasts.

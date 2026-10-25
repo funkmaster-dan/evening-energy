@@ -137,15 +137,37 @@ def project(settings,rows,soc,eta_c,eta_d,usage,trusted,periods):
 
 
 def chart_history(settings,now):
-    """Twenty-four hours of recorded five-minute averages from the live sensors."""
+    """Stable completed-hour power, a provisional endpoint, and five-minute battery."""
     start=now-pd.Timedelta(hours=24)
-    sensors={'load_actual':settings.consumption_entity,'solar_actual':settings.solar_ct_entity,'soc_actual':settings.battery_soc_entity}
-    frame=HomeAssistant(settings).frame(list(dict.fromkeys(sensors.values())),start,now,period='5minute')
-    rows=[]
+    sensors={'load_actual':settings.consumption_entity,'solar_actual':settings.solar_ct_entity}
+    ha=HomeAssistant(settings)
+    power=ha.frame(list(dict.fromkeys(sensors.values())),start.floor('h'),now,period='hour')
+    frame=ha.frame([settings.battery_soc_entity],start,now,period='5minute')
+    rows={}
     for t,values in frame.iterrows():
         time=max(start,t+pd.Timedelta(minutes=2.5))
         if time>=now:continue
-        rows.append({'time':time.isoformat(),**{key:float(values[entity]) if pd.notna(values[entity]) else None for key,entity in sensors.items()}})
+        rows[time]={'time':time.isoformat(),'soc_actual':float(values[settings.battery_soc_entity]) if pd.notna(values[settings.battery_soc_entity]) else None}
+    completed=power.loc[power.index+pd.Timedelta(hours=1)<=now]
+    last=completed.index[-1]
+    partial=now.floor('h') if now>now.floor('h') else None
+    # Exact hourly anchors prevent sampling from rounding off the final solid point.
+    for time in [*completed.index,now] if partial is not None else completed.index:
+        if start<=time<=now:
+            rows.setdefault(time,{'time':time.isoformat(),'soc_actual':None,'power_only':True})
+    for time,row in sorted(rows.items()):
+        hour=time.floor('h');next_hour=hour+pd.Timedelta(hours=1)
+        weight=(time-hour)/pd.Timedelta(hours=1)
+        for key,entity in sensors.items():
+            a=completed.at[hour,entity] if hour in completed.index else np.nan
+            b=completed.at[next_hour,entity] if next_hour in completed.index else a if time==last else np.nan
+            row[key]=float(a+(b-a)*weight) if time<=last and pd.notna(a) and pd.notna(b) else None
+            a=completed.at[last,entity]
+            b=power.at[partial,entity] if partial is not None and partial in power.index else np.nan
+            provisional=key.replace('_actual','_provisional')
+            row[provisional]=float(a+(b-a)*((time-last)/(now-last))) if time>=last and pd.notna(a) and pd.notna(b) else None
+        if partial is not None and time>last:row['power_cutoff']=now.isoformat()
+    rows=[row for _,row in sorted(rows.items())]
     # Open-Meteo's recent-past coverage is model-based, not an on-site observation.
     try:
         weather=consumption_weather(settings,start.floor('h'),now.ceil('h'))['temperature_2m']
@@ -268,7 +290,7 @@ class Forecaster:
                 self.history_cache=chart_history(settings,now);self.history_at=elapsed
             except Exception:
                 warnings.append('Recorded chart history is temporarily unavailable.')
-        actual_history=[r for r in self.history_cache if now-pd.Timedelta(hours=24)<=pd.Timestamp(r['time'])<now]
+        actual_history=[r for r in self.history_cache if now-pd.Timedelta(hours=24)<=pd.Timestamp(r['time'])<=now]
         chart=[{**row,**projections['low']['forecast'][i]} for i,row in enumerate(rows)]
         result={'updated_at':now.isoformat(),'valid_until':(now+pd.Timedelta(minutes=max(15,settings.battery_interval_minutes*3))).isoformat(),
                 'ready':trusted,'peak_active':export_active(now.tz_convert(settings.timezone),settings),

@@ -86,7 +86,7 @@ async def scheduler():
                     try: await update_forecast()
                     finally: last_forecast=now
         except Exception as exc:
-            last_error=str(exc); log.warning('Refresh: %s',exc); last_live=time.time()
+            last_error=str(exc); log.warning('Refresh: %s',exc,exc_info=True); last_live=time.time()
         await asyncio.sleep(10)
 
 @asynccontextmanager
@@ -192,7 +192,9 @@ def get_excess():
 @app.post('/api/refresh')
 async def refresh():
     try: return await update_forecast(force=True)
-    except Exception as exc: raise HTTPException(400,str(exc))
+    except Exception as exc:
+        log.exception('Manual forecast refresh failed')
+        raise HTTPException(400,str(exc))
 
 @app.get('/api/datasets')
 def datasets(): return list_datasets(settings)

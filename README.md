@@ -199,6 +199,8 @@ docker compose logs --tail=100
 
 Your mounted `data/` directory survives container rebuilds. It contains credentials, settings, sensor history, prepared datasets and trained models: keep it private and preserve it when moving installations. No household dataset or pretrained model is distributed in this repository.
 
+Failed scheduled and manual forecast refreshes log a full traceback, including chained exceptions. If weather retrieval fails, inspect `docker compose logs --tail=100` for the original HTTP, connection or cache error alongside the dashboard's summary message.
+
 Existing installations migrate the old single export window to the window list. Saved settings remain in use. Model readiness checks determine whether a stored model is compatible; prepare replacement data and train a candidate when the interface requires it.
 
 ### When something needs attention

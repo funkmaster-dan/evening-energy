@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.0
+
+- Log full tracebacks and chained exceptions when scheduled or manual forecast refreshes fail, exposing the original weather, connection or cache error.
+- Preserve the existing dashboard error messages and forecast expiry behavior.
+
 ## v1.2.2
 
 - Show consumption and solar history as interpolated hourly averages, matching the forecast presentation.

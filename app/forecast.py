@@ -1,6 +1,6 @@
 import joblib, numpy as np, pandas as pd
-from .config import DATA, read_json, write_json, solar_banks
-from .sources import HomeAssistant, Calendar, consumption_weather, solar_weather
+from .config import DATA, read_json, solar_banks
+from .sources import HomeAssistant, Calendar, consumption_weather, solar_weather, LIVE_WEATHER_MAX_AGE
 from .datasets import features, bank_features, splice
 from .models import model_ready
 from .ha_inputs import snapshot_age
@@ -10,6 +10,8 @@ from .quality import QUALITY_POLICY, active_policy, LOAD_PIPELINE, quality_frame
 from .uncertainty import energy_scenarios
 from .battery import (inside, export_active, export_rate, window_day, simulate_paths, allowances, acceptable, export_periods, plan_exports,
                       POLICY, IMPORT_TOLERANCE_KWH, RESERVE_TOLERANCE_SOC, DELIVERY_TOLERANCE_KWH)
+
+SOC_MAX_AGE = pd.Timedelta(minutes=15)
 
 def simulate(settings, rows, initial_soc, eta_c, eta_d, export_kwh=0, export_cutoff=None, used_allowance=None, export_schedule=None):
     """Format a single path from the shared battery engine for existing callers."""
@@ -45,11 +47,14 @@ def excess(settings,rows,soc,eta_c,eta_d,used_allowance):
 
 def allowance_used(settings, now):
     """Estimate actual charging-window import from measured load, solar and battery I/O."""
+    local=now.tz_convert(settings.timezone)
+    active={f'{i}:{window_day(local,w)}':w.limit_kwh for i,w in enumerate(settings.charging_windows) if inside(local,w.start,w.end)}
+    if not active:return {}
     calibration=read_json('model-battery',{})
-    sign=calibration.get('power_sign',1); local=now.tz_convert(settings.timezone)
+    sign=calibration.get('power_sign',1)
     start=local.normalize()-pd.Timedelta(days=1)
     try:
-        frame=HomeAssistant(settings).frame([settings.consumption_entity,settings.solar_ct_entity,settings.battery_power_entity],start.tz_convert('UTC'),now,'5minute')
+        frame=HomeAssistant(settings,timeout=15).frame([settings.consumption_entity,settings.solar_ct_entity,settings.battery_power_entity],start.tz_convert('UTC'),now,'5minute')
         use={}
         for t,row in frame.dropna().iterrows():
             tl=t.tz_convert(settings.timezone)
@@ -58,13 +63,9 @@ def allowance_used(settings, now):
                 if inside(tl,w.start,w.end):
                     key=f'{i}:{window_day(tl,w)}'; use[key]=use.get(key,0)+imported; break
         # No past records during an already started window: assume its allowance used.
-        for i,w in enumerate(settings.charging_windows):
-            if inside(local,w.start,w.end):
-                key=f'{i}:{window_day(local,w)}'
-                if key not in use: use[key]=w.limit_kwh
-        return use
+        return {key:use.get(key,limit) for key,limit in active.items()}
     except Exception:
-        return {f'{i}:{window_day(local,w)}':w.limit_kwh for i,w in enumerate(settings.charging_windows) if inside(local,w.start,w.end)}
+        return active
 
 SCENARIOS={
     'low':{'name':'Conservative','solar_percentile':10,'load_percentile':90,'energy_basis':'12-hour','solar_key':'low','load_key':'high'},
@@ -140,7 +141,7 @@ def chart_history(settings,now):
     """Stable completed-hour power, a provisional endpoint, and five-minute battery."""
     start=now-pd.Timedelta(hours=24)
     sensors={'load_actual':settings.consumption_entity,'solar_actual':settings.solar_ct_entity}
-    ha=HomeAssistant(settings)
+    ha=HomeAssistant(settings,timeout=15)
     power=ha.frame(list(dict.fromkeys(sensors.values())),start.floor('h'),now,period='hour')
     frame=ha.frame([settings.battery_soc_entity],start,now,period='5minute')
     rows={}
@@ -185,8 +186,6 @@ class Forecaster:
         self.load_cache=None; self.solar_cache=None; self.load_at=0; self.solar_at=0
         self.history_cache=[];self.history_at=0
 
-    def reset(self): self.load_at=0; self.solar_at=0; self.load_cache=None; self.solar_cache=None
-
     def run(self,settings,live,force=False):
         now=pd.Timestamp.now(tz='UTC'); end=forecast_end(settings,now)
         hours=pd.date_range(now.floor('h'),end.ceil('h'),freq='1h')
@@ -197,14 +196,22 @@ class Forecaster:
         if not ready_solar: warnings.append('Solar production model needs calibration for the current configuration.')
         if not battery_ready: warnings.append('Battery efficiencies need measured calibration.')
         elapsed=now.timestamp()
-        need_load=force or self.load_cache is None or elapsed-self.load_at>=settings.load_interval_minutes*60 or self.load_cache.index.max()<hours[-1]
-        need_solar=force or self.solar_cache is None or elapsed-self.solar_at>=settings.solar_interval_minutes*60 or self.solar_cache.index.max()<hours[-1]
-        if need_load or need_solar:
-            # Fetch weather only when an actual model refresh is due.
-            cache_hours=pd.date_range(hours[0],periods=73,freq='h')
+        def refresh_due(cache, updated_at, interval_minutes):
+            if force or cache is None or cache.index.max()<hours[-1]:
+                return True
+            if cache.attrs.get('cached_weather'):
+                interval_minutes=min(interval_minutes,5)
+            fetched_at=cache.attrs.get('fetched_at')
+            return (elapsed-updated_at>=interval_minutes*60 or
+                    (fetched_at and now>=pd.Timestamp(fetched_at)+LIVE_WEATHER_MAX_AGE))
+
+        need_load=refresh_due(self.load_cache,self.load_at,settings.load_interval_minutes)
+        need_solar=refresh_due(self.solar_cache,self.solar_at,settings.solar_interval_minutes)
+        cache_hours=pd.date_range(hours[0],periods=73,freq='h')
+        if need_load:
             weather_available=True
             try:
-                weather=consumption_weather(settings,cache_hours[0],cache_hours[-1]+pd.Timedelta(hours=1))
+                weather=consumption_weather(settings,cache_hours[0],cache_hours[-1]+pd.Timedelta(hours=1)).reindex(cache_hours)
             except Exception as exc:
                 weather_available=False
                 warnings.append(f'Chosen weather model unavailable: {exc}')
@@ -212,49 +219,53 @@ class Forecaster:
                 weather=pd.DataFrame({'temperature_2m':20.,'shortwave_radiation':0.},index=cache_hours)
             calendar=Calendar(settings).load();f=features(weather,settings,calendar).reindex(cache_hours)
             if calendar.summary(hours)['missing_school_hours']:warnings.append('School calendar does not cover the forecast period.')
-            if need_load:
-                history_start=hours[0]-pd.Timedelta(days=58)
-                policy=active_policy(settings,'load');history_entities=policy['entities'] or settings.historical_consumption_entities
-                recent=HomeAssistant(settings).frame(history_entities,history_start,hours[0],measurement_kind='load',max_power_kw=policy['max_power_kw'],units=policy['units'],corrections=policy['corrections'])
-                observed=splice(recent,history_entities,policy['combine']) if not recent.empty else pd.Series(dtype=float,index=pd.DatetimeIndex([],tz='UTC'))
-                context,quality=quality_frame(observed,settings,'load',policy['max_power_kw'],corrections=policy['corrections'],minmax=target_bounds(recent,history_entities))
-                metadata=load_context_metadata(recent,history_entities,settings,quality,policy['combine'],policy['max_power_kw'])
-                context.attrs={};f.attrs={}
-                f=pd.concat([context,f]).sort_index();attach_load_context(f,metadata)
-                profile=read_json('model-load',{}).get('hour_profile',{})
-                if ready_load:
-                    artifact=joblib.load(DATA/'load.joblib');predictor=LoadPredictor(artifact)
-                    from .load_training import feature_rows
-                    x=feature_rows(f,hours[0],cache_hours,settings.timezone,legacy=artifact.get('pipeline')=='lightgbm-quantile-direct-v2')
-                    run=weather.attrs.get('run');x['weather_run_age']=(hours[0]-pd.Timestamp(run)).total_seconds()/3600 if run else np.nan
-                    q=predictor.predict(x)
-                    model_id=read_json('model-load',{}).get('trained_at','legacy')
-                    q['base_point']=q['point'].copy()
-                    q['point']=np.maximum(0,q['point']+recent_correction(settled_records('load',hours[0],model_identity=model_id),hours[0],x.lead_hours,artifact.get('correction')))
-                    record_issue('load',hours[0],cache_hours,x,q,weather,model_id,issued_at=now.isoformat())
-                    values={f'load_{k}':q[k] for k in ('low','middle','high','point')}
-                else:
-                    base=np.array([float(profile.get(str(t.tz_convert(settings.timezone).hour),1.)) for t in cache_hours])
-                    values={f'load_{k}':base for k in ('low','middle','high','point')}
-                    warnings.append('Generic hourly consumption profile is display-only; allowances require calibration.')
-                values['temperature_c']=weather['temperature_2m'].reindex(cache_hours).astype(object).where(lambda x:x.notna(),None).to_numpy() if weather_available else [None]*len(cache_hours)
-                self.load_cache=pd.DataFrame(values,index=cache_hours);self.load_at=elapsed
-            if need_solar:
-                total=pd.DataFrame(0.,index=cache_hours,columns=['solar_low','solar_middle','solar_high','solar_point',*[f'solar_{k}_{b.id}' for b in solar_banks(settings) for k in ('low','middle','high','point')]])
-                for bank in solar_banks(settings):
-                    name='solar-'+bank.id
-                    if model_ready(settings,name,'solar',bank.id):
-                        from .solar_training import solar_predict as bank_quantiles
-                        solar=solar_weather(settings,bank,cache_hours[0],cache_hours[-1]+pd.Timedelta(hours=1))
-                        x=bank_features(solar.reindex(cache_hours),bank,settings,hours[0])
-                        if x.drop(columns=['weather_run_age','lead_hours']).isna().any().any(): raise ValueError(f'Incomplete Open-Meteo solar forecast for {bank.name}')
-                        model_id=read_json('model-'+name,{}).get('trained_at','legacy')
-                        pred=bank_quantiles(joblib.load(DATA/(name+'.joblib')),x,settled_records(name,hours[0],model_identity=model_id),hours[0])
-                        record_issue(name,hours[0],cache_hours,x,pred,solar,model_id,issued_at=now.isoformat())
-                    else: pred={k:np.zeros(len(cache_hours)) for k in ('low','middle','high','point')}
-                    for k in ('low','middle','high','point'):
-                        total[f'solar_{k}_{bank.id}']=pred[k];total['solar_'+k]+=pred[k]
-                self.solar_cache=total; self.solar_at=elapsed
+            history_start=hours[0]-pd.Timedelta(days=58)
+            policy=active_policy(settings,'load');history_entities=policy['entities'] or settings.historical_consumption_entities
+            recent=HomeAssistant(settings,timeout=20).frame(history_entities,history_start,hours[0],measurement_kind='load',max_power_kw=policy['max_power_kw'],units=policy['units'],corrections=policy['corrections'])
+            observed=splice(recent,history_entities,policy['combine']) if not recent.empty else pd.Series(dtype=float,index=pd.DatetimeIndex([],tz='UTC'))
+            context,quality=quality_frame(observed,settings,'load',policy['max_power_kw'],corrections=policy['corrections'],minmax=target_bounds(recent,history_entities))
+            metadata=load_context_metadata(recent,history_entities,settings,quality,policy['combine'],policy['max_power_kw'])
+            context.attrs={};f.attrs={}
+            f=pd.concat([context,f]).sort_index();attach_load_context(f,metadata)
+            profile=read_json('model-load',{}).get('hour_profile',{})
+            if ready_load:
+                artifact=joblib.load(DATA/'load.joblib');predictor=LoadPredictor(artifact)
+                from .load_training import feature_rows
+                x=feature_rows(f,hours[0],cache_hours,settings.timezone,legacy=artifact.get('pipeline')=='lightgbm-quantile-direct-v2')
+                run=weather.attrs.get('run');x['weather_run_age']=(hours[0]-pd.Timestamp(run)).total_seconds()/3600 if run else np.nan
+                q=predictor.predict(x)
+                model_id=read_json('model-load',{}).get('trained_at','legacy')
+                q['base_point']=q['point'].copy()
+                q['point']=np.maximum(0,q['point']+recent_correction(settled_records('load',hours[0],model_identity=model_id),hours[0],x.lead_hours,artifact.get('correction')))
+                record_issue('load',hours[0],cache_hours,x,q,weather,model_id,issued_at=now.isoformat())
+                values={f'load_{k}':q[k] for k in ('low','middle','high','point')}
+            else:
+                base=np.array([float(profile.get(str(t.tz_convert(settings.timezone).hour),1.)) for t in cache_hours])
+                values={f'load_{k}':base for k in ('low','middle','high','point')}
+                warnings.append('Generic hourly consumption profile is display-only; allowances require calibration.')
+            values['temperature_c']=weather['temperature_2m'].reindex(cache_hours).astype(object).where(lambda x:x.notna(),None).to_numpy() if weather_available else [None]*len(cache_hours)
+            self.load_cache=pd.DataFrame(values,index=cache_hours);self.load_at=elapsed
+            self.load_cache.attrs={k:weather.attrs[k] for k in ('fetched_at','cached_weather') if k in weather.attrs}
+        if need_solar:
+            total=pd.DataFrame(0.,index=cache_hours,columns=['solar_low','solar_middle','solar_high','solar_point',*[f'solar_{k}_{b.id}' for b in solar_banks(settings) for k in ('low','middle','high','point')]])
+            weather_times=[];cached_weather=False
+            for bank in solar_banks(settings):
+                name='solar-'+bank.id
+                if model_ready(settings,name,'solar',bank.id):
+                    from .solar_training import solar_predict as bank_quantiles
+                    solar=solar_weather(settings,bank,cache_hours[0],cache_hours[-1]+pd.Timedelta(hours=1))
+                    weather_times.append(solar.attrs['fetched_at'])
+                    cached_weather=cached_weather or solar.attrs.get('cached_weather',False)
+                    x=bank_features(solar.reindex(cache_hours),bank,settings,hours[0])
+                    if x.drop(columns=['weather_run_age','lead_hours']).isna().any().any(): raise ValueError(f'Incomplete Open-Meteo solar forecast for {bank.name}')
+                    model_id=read_json('model-'+name,{}).get('trained_at','legacy')
+                    pred=bank_quantiles(joblib.load(DATA/(name+'.joblib')),x,settled_records(name,hours[0],model_identity=model_id),hours[0])
+                    record_issue(name,hours[0],cache_hours,x,pred,solar,model_id,issued_at=now.isoformat())
+                else: pred={k:np.zeros(len(cache_hours)) for k in ('low','middle','high','point')}
+                for k in ('low','middle','high','point'):
+                    total[f'solar_{k}_{bank.id}']=pred[k];total['solar_'+k]+=pred[k]
+            if weather_times:total.attrs.update(fetched_at=min(weather_times),cached_weather=cached_weather)
+            self.solar_cache=total; self.solar_at=elapsed
         # Fifteen minute dispatch plus a partial first/final step. Preserve exact horizon duration.
         boundaries=[now]+list(pd.date_range(now.ceil('15min'),end,freq='15min'))+[end]
         first_day=now.tz_convert(settings.timezone).normalize()-pd.DateOffset(days=1)
@@ -271,11 +282,16 @@ class Forecaster:
             row['charging_window']=any(inside(a.tz_convert(settings.timezone),w.start,w.end) for w in settings.charging_windows)
             row['net_demand_kw']=row['load_point']-row['solar_point'];row['net_demand_low']=row['load_low']-row['solar_high'];row['net_demand_high']=row['load_high']-row['solar_low'];rows.append(row)
         soc=live.get('soc'); age=snapshot_age(live,now)
-        trusted=bool(ready_load and ready_solar and battery_ready and soc is not None and age<900)
+        trusted=bool(ready_load and ready_solar and battery_ready and soc is not None and age<SOC_MAX_AGE.total_seconds())
         if soc is not None and soc<settings.minimum_soc:warnings.append('Reported battery SoC is below the operating minimum; the projection retains the reported state.')
         if settings.mc_samples<500:warnings.append('Small Monte Carlo sample count: percentile and risk estimates may be unstable.')
         if soc is None: warnings.append('Battery SoC is unavailable or invalid in Home Assistant; export allowance is zero.')
-        elif age>=900: warnings.append('No successful Home Assistant snapshot within 15 minutes; export allowance is zero.')
+        elif age>=SOC_MAX_AGE.total_seconds(): warnings.append('No successful Home Assistant snapshot within 15 minutes; export allowance is zero.')
+        weather_inputs=[self.load_cache.attrs,self.solar_cache.attrs]
+        weather_times=[pd.Timestamp(source['fetched_at']) for source in weather_inputs if 'fetched_at' in source]
+        weather_data_at=min(weather_times) if weather_times else None
+        cached_weather=any(source.get('cached_weather') for source in weather_inputs)
+        if cached_weather:warnings.append('Open-Meteo is temporarily unavailable. The forecast uses recent cached weather.')
         missing=[name for name in ('load_kw','solar_kw','battery_kw') if live.get(name) is None]
         if missing:warnings.append('Live HA readings unavailable: '+', '.join(missing)+'. Historical forecasts remain in use.')
         eta_c=eta_meta.get('charge_efficiency',.9) if battery_ready else .9; eta_d=eta_meta.get('discharge_efficiency',.9) if battery_ready else .9
@@ -292,7 +308,13 @@ class Forecaster:
                 warnings.append('Recorded chart history is temporarily unavailable.')
         actual_history=[r for r in self.history_cache if now-pd.Timedelta(hours=24)<=pd.Timestamp(r['time'])<=now]
         chart=[{**row,**projections['low']['forecast'][i]} for i,row in enumerate(rows)]
-        result={'updated_at':now.isoformat(),'valid_until':(now+pd.Timedelta(minutes=max(15,settings.battery_interval_minutes*3))).isoformat(),
+        valid_until=now+pd.Timedelta(minutes=max(15,settings.battery_interval_minutes*3))
+        if trusted:
+            valid_until=min(valid_until,pd.Timestamp(live['updated_at'])+SOC_MAX_AGE)
+        if weather_data_at is not None:
+            valid_until=min(valid_until,weather_data_at+LIVE_WEATHER_MAX_AGE)
+        result={'updated_at':now.isoformat(),'valid_until':valid_until.isoformat(),
+                'weather_cached':cached_weather,'weather_data_at':weather_data_at.isoformat() if weather_data_at is not None else None,
                 'ready':trusted,'peak_active':export_active(now.tz_convert(settings.timezone),settings),
                 'percentiles':mapping,'percentile_basis':'Scenario labels only; see scenarios for separate solar/load input quantiles','horizon_hours':round((end-now).total_seconds()/3600,2),'scenarios':SCENARIOS,'energy_period_forecast':periods['periods'],'energy_period_basis':periods['basis'],'excess_kwh':available,'achievable_export_kwh':values,
                 'excess_percent':{k:round(v/settings.battery_capacity_kwh*100,2) for k,v in available.items()},
@@ -313,4 +335,4 @@ class Forecaster:
                 'energy_metric_basis':{'excess_kwh':'Stored battery energy above forecast household needs and configured minimum/reserve; not capped by export power or peak time',
                                        'achievable_export_kwh':'AC energy deliverable to the grid in the current/upcoming peak; limited by excess, discharge losses, inverter power and remaining time'},
                 'note':'Conservative uses P10 solar/P90 consumption per 12-hour block, middle P50/P50, optimistic P90/P10. Blocks are 06:00–18:00 and 18:00–06:00 local time. Each block follows the forecast hourly shape. A single trajectory per scenario determines its export allowance over the full forecast at the same fixed discharge rate. Every charging and export window is simulated; export allowances are allocated in time order. Shading spans scenarios under the same per-window export targets; it is not a probability interval.'}
-        write_json('forecast',result); return result
+        return result

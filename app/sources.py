@@ -1,6 +1,8 @@
 """Read-only Home Assistant, Open-Meteo, and Australian calendar inputs."""
 import json, re, sqlite3, time
 from datetime import date, timedelta
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
 import httpx, numpy as np, pandas as pd, holidays
 from websockets.sync.client import connect
@@ -9,13 +11,14 @@ from .forecast_policy import archived_run,INTERVAL_POLICY
 from .ha_inputs import numeric_value, history_values, history_intervals, normalized_value
 
 class HomeAssistant:
-    def __init__(self, settings):
+    def __init__(self, settings, timeout=120):
         self.s=settings
+        self.timeout=timeout
         self.url=settings.ha_url.rstrip('/')
         self.headers={'Authorization':'Bearer '+settings.ha_token}
 
     def get(self, path, params=None):
-        with httpx.Client(timeout=120, headers=self.headers) as c:
+        with httpx.Client(timeout=self.timeout, headers=self.headers) as c:
             r=c.get(self.url+path, params=params); r.raise_for_status(); return r.json()
 
     def states(self):
@@ -24,11 +27,11 @@ class HomeAssistant:
     def ws(self, message):
         u=urlparse(self.url); wsurl=('wss' if u.scheme=='https' else 'ws')+'://'+u.netloc+u.path+'/api/websocket'
         with connect(wsurl, open_timeout=20, max_size=100*1024*1024) as ws:
-            ws.recv(); ws.send(json.dumps({'type':'auth','access_token':self.s.ha_token}))
-            if json.loads(ws.recv())['type']!='auth_ok': raise ValueError('Home Assistant rejected the API token')
+            ws.recv(timeout=self.timeout); ws.send(json.dumps({'type':'auth','access_token':self.s.ha_token}))
+            if json.loads(ws.recv(timeout=self.timeout))['type']!='auth_ok': raise ValueError('Home Assistant rejected the API token')
             ws.send(json.dumps({'id':1, **message}))
             while True:
-                result=json.loads(ws.recv(timeout=120))
+                result=json.loads(ws.recv(timeout=self.timeout))
                 if result.get('id')==1:
                     if not result.get('success'): raise ValueError(str(result.get('error')))
                     return result['result']
@@ -213,20 +216,89 @@ def store_live(states):
         db.execute("DELETE FROM samples WHERE time < ?",((pd.Timestamp.now(tz='UTC')-pd.Timedelta(days=120)).isoformat(),))
 
 
+LIVE_WEATHER_MAX_AGE = pd.Timedelta(hours=6)
+_weather_retry_at = {}
+
+
+def live_weather(prefix, start, end, columns, fetch):
+    """Reuse a recent, complete weather response across forecast origins."""
+    path = DATA / f'{prefix}rolling.pkl'
+    hours = pd.date_range(start, end, freq='h', inclusive='left')
+    now = time.time()
+
+    def complete(frame):
+        return np.isfinite(frame.reindex(index=hours, columns=columns).to_numpy(dtype=float)).all()
+
+    def cached(file):
+        try:
+            age = now - file.stat().st_mtime
+            if age < LIVE_WEATHER_MAX_AGE.total_seconds():
+                frame = pd.read_pickle(file)
+                if complete(frame):
+                    frame.attrs['fetched_at'] = pd.Timestamp(now-age, unit='s', tz='UTC').isoformat()
+                    return frame, age
+        except (OSError, ValueError, EOFError):
+            pass
+        return None, float('inf')
+
+    frame, age = cached(path)
+    if age < 1200:
+        return frame
+    try:
+        if now < _weather_retry_at.get(prefix, 0):
+            raise ValueError('Open-Meteo retry is pending')
+        today = pd.Timestamp.now(tz='UTC').normalize()
+        fresh = fetch(min(start.normalize(), today-pd.Timedelta(days=1)),
+                      max(end.normalize()+pd.Timedelta(days=1), today+pd.Timedelta(days=5)))
+        if not complete(fresh):
+            raise ValueError('Open-Meteo returned incomplete hourly weather')
+        fresh.attrs['fetched_at'] = pd.Timestamp.now(tz='UTC').isoformat()
+        with NamedTemporaryFile(dir=DATA, delete=False) as tmp:
+            temporary = Path(tmp.name)
+        try:
+            fresh.to_pickle(temporary)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return fresh
+    except (httpx.HTTPError, KeyError, ValueError) as exc:
+        if now >= _weather_retry_at.get(prefix, 0):
+            _weather_retry_at[prefix] = time.time() + 60
+        if frame is None:
+            # Older installations cached each request under its own hour range.
+            candidates = sorted(DATA.glob(f'{prefix}[0-9]*.pkl'), key=lambda f: f.stat().st_mtime, reverse=True)
+            for candidate in candidates:
+                frame, age = cached(candidate)
+                if frame is not None:
+                    break
+                if now-candidate.stat().st_mtime >= LIVE_WEATHER_MAX_AGE.total_seconds():
+                    break
+        if frame is None:
+            raise ValueError(f'Open-Meteo live weather unavailable ({type(exc).__name__})') from exc
+        frame.attrs['cached_weather'] = True
+        return frame
+
+
 def forecast_weather(settings,start,end,model='ecmwf_ifs'):
     """Fetch the selected weather model for the live forecast."""
     start=pd.Timestamp(start); end=pd.Timestamp(end)
-    key=f'weather-live-v2-{settings.latitude:.4f}-{settings.longitude:.4f}-{model}-{start.strftime("%Y%m%d%H")}-{end.strftime("%Y%m%d%H")}'
-    file=DATA/(key+'.pkl')
-    if file.exists() and time.time()-file.stat().st_mtime<1200: return pd.read_pickle(file)
-    params={'latitude':settings.latitude,'longitude':settings.longitude,'models':model,'hourly':'temperature_2m,shortwave_radiation,direct_normal_irradiance,diffuse_radiation','timezone':'UTC','start_date':str(start.date()),'end_date':str((end+pd.Timedelta(days=1)).date())}
-    with httpx.Client(timeout=120) as c:
-        r=c.get('https://api.open-meteo.com/v1/forecast',params=params); r.raise_for_status(); h=r.json()['hourly']
-    f=pd.DataFrame(h); f.index=pd.to_datetime(f.pop('time'),utc=True)
+    prefix=f'weather-live-v2-{settings.latitude:.4f}-{settings.longitude:.4f}-{model}-'
     columns=['temperature_2m','shortwave_radiation','direct_normal_irradiance','diffuse_radiation']
-    for col in columns:
-        if col not in f and col+'_'+model in f: f[col]=f[col+'_'+model]
-    f=weather_intervals(f[columns]); f.attrs.update(run=None,run_basis='Stitched operational response; initialization unknown'); f.to_pickle(file); return f
+
+    def fetch(left,right):
+        params={'latitude':settings.latitude,'longitude':settings.longitude,'models':model,'hourly':','.join(columns),'timezone':'UTC','start_date':str(left.date()),'end_date':str(right.date())}
+        with httpx.Client(timeout=8) as client:
+            response=client.get('https://api.open-meteo.com/v1/forecast',params=params)
+            response.raise_for_status()
+            frame=pd.DataFrame(response.json()['hourly'])
+        frame.index=pd.to_datetime(frame.pop('time'),utc=True)
+        for col in columns:
+            if col not in frame and col+'_'+model in frame: frame[col]=frame[col+'_'+model]
+        frame=weather_intervals(frame[columns])
+        frame.attrs.update(run=None,run_basis='Stitched operational response; initialization unknown')
+        return frame
+
+    return live_weather(prefix,start,end,columns[:2],fetch)
 
 
 def solar_weather(settings,bank,start,end,historical=False,issued_at=None,cached_only=False):
@@ -238,6 +310,9 @@ def solar_weather(settings,bank,start,end,historical=False,issued_at=None,cached
         for i,(b,f) in enumerate(frames):result[f'bank_irradiance_{i}']=f['tilted_irradiance']*b.panel_count/count
         result['tilted_irradiance']=result[[f'bank_irradiance_{i}' for i in range(len(frames))]].sum(axis=1,min_count=len(frames))
         result.attrs={**frames[0][1].attrs,'irradiance_source':'Panel-count-weighted Open-Meteo tilted irradiance'}
+        if not historical and issued_at is None:
+            result.attrs['fetched_at']=min(f.attrs['fetched_at'] for _,f in frames)
+            result.attrs['cached_weather']=any(f.attrs.get('cached_weather') for _,f in frames)
         return result
     start=pd.Timestamp(start); end=pd.Timestamp(end)
     # Allow for global-model publication after initialization, rather than using
@@ -245,7 +320,11 @@ def solar_weather(settings,bank,start,end,historical=False,issued_at=None,cached
     run=archived_run(issued_at) if issued_at is not None else None
     mode=run.strftime('%Y%m%d%H') if run is not None else ('history' if historical else 'live')
     model=settings.weather_model
-    key=f'solar-weather-v3-{settings.latitude:.6f}-{settings.longitude:.6f}-{bank.tilt:g}-{bank.azimuth:g}-{model}-{mode}-{start.strftime("%Y%m%d%H")}-{end.strftime("%Y%m%d%H")}'
+    prefix=f'solar-weather-v3-{settings.latitude:.6f}-{settings.longitude:.6f}-{bank.tilt:g}-{bank.azimuth:g}-{model}-{mode}-'
+    if mode == 'live' and not cached_only:
+        columns=['temperature_2m','shortwave_radiation','tilted_irradiance']
+        return live_weather(prefix,start,end,columns,lambda left,right: fetch_solar_weather(settings,bank,left,right))
+    key=f'{prefix}{start.strftime("%Y%m%d%H")}-{end.strftime("%Y%m%d%H")}'
     path=DATA/(key+'.pkl')
     if path.exists() and (historical or run is not None or time.time()-path.stat().st_mtime<1200):
         return pd.read_pickle(path)
@@ -256,6 +335,14 @@ def solar_weather(settings,bank,start,end,historical=False,issued_at=None,cached
                 frame=pd.read_pickle(cached)
                 if frame.index.min()<=start and frame.index.max()>=end-pd.Timedelta(hours=1) and frame.attrs.get('run')==run.isoformat():return frame
     if cached_only:raise ValueError('Archived solar weather is not cached')
+    result=fetch_solar_weather(settings,bank,start,end,historical,run)
+    result.to_pickle(path)
+    return result
+
+
+def fetch_solar_weather(settings,bank,start,end,historical=False,run=None):
+    model=settings.weather_model
+    live=run is None and not historical
     params={'latitude':settings.latitude,'longitude':settings.longitude,'hourly':'temperature_2m,shortwave_radiation,global_tilted_irradiance','timezone':'UTC','tilt':bank.tilt,'azimuth':(bank.azimuth%360)-180}
     if run is not None:
         ranges=[(start,end,'https://single-runs-api.open-meteo.com/v1/forecast')]
@@ -265,7 +352,8 @@ def solar_weather(settings,bank,start,end,historical=False,issued_at=None,cached
     else:
         ranges=[(start,end,'https://api.open-meteo.com/v1/forecast')]
     chunks=[]
-    with httpx.Client(timeout=30 if run is not None else 120) as client:
+    attempts=2 if live else 4
+    with httpx.Client(timeout=8 if live else 30 if run is not None else 120) as client:
         for left,right,url in ranges:
             if left>right: continue
             q={**params,'start_date':str(left.date()),'end_date':str((right+pd.Timedelta(days=1)).date())}
@@ -273,10 +361,10 @@ def solar_weather(settings,bank,start,end,historical=False,issued_at=None,cached
                 q.pop('start_date'); q.pop('end_date')
                 q.update(models=model,run=run.strftime('%Y-%m-%dT%H:%M'),forecast_days=7)
             elif 'archive-api' not in url: q['models']=model
-            for attempt in range(4):
+            for attempt in range(attempts):
                 response=client.get(url,params=q)
-                if response.status_code not in (429,500,502,503,504): break
-                time.sleep(min(15,3*(attempt+1)))
+                if response.status_code not in (429,500,502,503,504) or attempt==attempts-1: break
+                time.sleep(1 if live else min(15,3*(attempt+1)))
             response.raise_for_status(); hourly=response.json()['hourly']
             frame=pd.DataFrame(hourly)
             frame.index=pd.to_datetime(frame.pop('time'),utc=True)
@@ -288,7 +376,6 @@ def solar_weather(settings,bank,start,end,historical=False,issued_at=None,cached
     result=pd.concat(chunks).sort_index(); result=result[~result.index.duplicated(keep='last')]
     result=weather_intervals(result)
     result.attrs={'interval_policy':INTERVAL_POLICY,'run_basis':'Conservative archived initialization' if run is not None else 'Historical proxy' if historical else 'Stitched operational response; initialization unknown','irradiance_source':'Open-Meteo global_tilted_irradiance','weather_model':model,'run':run.isoformat() if run is not None else None,'publication_buffer_hours':12 if run is not None else None}
-    result.to_pickle(path)
     return result
 
 

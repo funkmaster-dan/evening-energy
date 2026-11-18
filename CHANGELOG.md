@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.1
+
+- Keep forecasts refreshing through temporary Open-Meteo failures by reusing recent weather and current Home Assistant battery readings.
+- Reuse the last forecast after restart and show when a forecast uses cached weather.
+- Retry failed refreshes sooner and continue polling Home Assistant during a forecast refresh.
+- Keep export allowances at zero once required inputs or the forecast expire.
+
 ## v1.3.0
 
 - Log full tracebacks and chained exceptions when scheduled or manual forecast refreshes fail, exposing the original weather, connection or cache error.

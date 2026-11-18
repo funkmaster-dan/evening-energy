@@ -152,6 +152,8 @@ Install [Energy Excess](https://github.com/funkmaster-dan/ha-energy-excess) thro
 
 It provides **twelve derived sensors**: conservative/middle/optimistic battery excess and achievable export, each in kWh and battery percentage. Attributes identify the energy basis and readiness. Unavailable inputs or incomplete calibration produce zero allowances with `ready: false`; expired forecasts also return zero allowances. An unreachable app or expired forecast makes the integration’s sensors unavailable.
 
+During a temporary Open-Meteo outage, the app can recompute forecasts with weather cached within the past six hours when it covers the forecast period. The dashboard shows when it uses cached weather, and export allowances still require a current Home Assistant battery reading. After a restart the dashboard can display the last forecast while the app refreshes its inputs.
+
 An [optional export automation example](home_assistant/README.md) shows how to use the forecasts with a compatible controller. Check its entity IDs, timing and discharge assumptions against your installation.
 
 For custom consumers, the app exposes:
